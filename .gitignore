@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+
+# 虚拟环境
+venv/
+.venv/
+env/
+
+# 用户实际配置 (路径因人而异, 首次运行自动创建)
+config.json
+user_preferences.json
+config.example.json.local
+
+# 运行时生成的日志和预设
+logs/
+router-preset.ini
+
+# 临时文件
+*.tmp
+*.bak
+*.swp
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.iml
+
+# 测试 / 调试
+.pytest_cache/
+.tox/
+.coverage
+htmlcov/
+
+# 本地临时 vbs
+*.vbs
+!launch_ui_hidden.vbs

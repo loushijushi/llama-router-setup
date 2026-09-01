@@ -1,0 +1,30 @@
+{
+    "llama_dir": "C:\\llama.cpp",
+    "host": "0.0.0.0",
+    "port": 8080,
+    "models_max": 1,
+    "sleep_idle_seconds": 3600,
+    "watchdog": {
+        "enabled": false,
+        "free_mb_threshold": 2048,
+        "check_interval_seconds": 10,
+        "min_idle_seconds": 0
+    },
+    "models": [
+        {
+            "id": "my-model-1",
+            "alias": "model1",
+            "model": "C:\\path\\to\\model.gguf",
+            "mmproj": "",
+            "draft_model": "",
+            "draft_type": "",
+            "draft_n_max": 3,
+            "draft_n_min": 0,
+            "draft_p_split": 0.1,
+            "draft_p_min": 0.0,
+            "draft_ngl": "auto",
+            "enabled": true,
+            "params": {}
+        }
+    ]
+}
