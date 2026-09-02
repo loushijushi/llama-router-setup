@@ -11,7 +11,7 @@ on:
       version:
         description: '版本号 (如 1.0.0, 不带 v 前缀)'
         required: true
-        default: '0.1.0'
+        default: '0.0.1'
 
 permissions:
   contents: write   # 创建 release 需要写权限
@@ -19,7 +19,7 @@ permissions:
 jobs:
   build:
     name: Build release zip
-    runs-on: windows-latest   # 必须是 Windows, 我们的项目只能在 Windows 运行
+    runs-on: windows-latest
 
     steps:
       - name: 检出代码
@@ -33,35 +33,81 @@ jobs:
       - name: 显示环境信息
         shell: pwsh
         run: |
+          Write-Host "=== Environment ==="
           Write-Host "OS: $env:RUNNER_OS"
           Write-Host "Python: $(python --version)"
-          Write-Host "Tag: $env:GITHUB_REF_NAME"
+          Write-Host "Ref type: $env:GITHUB_REF_TYPE"
+          Write-Host "Ref name: $env:GITHUB_REF_NAME"
           Write-Host "Repo: $env:GITHUB_REPOSITORY"
+          Write-Host "Workspace: $env:GITHUB_WORKSPACE"
+          Write-Host ""
+          Write-Host "=== Working directory ==="
+          Get-Location
+          Write-Host ""
+          Write-Host "=== Files in workspace ==="
+          Get-ChildItem -Force | Select-Object Name | Format-Table -HideTableHeaders
 
-      - name: 构建 zip
+      - name: 验证 build_release.py 存在
         shell: pwsh
         run: |
-          # 优先用 tag 名 (去掉 v 前缀), 手动触发用输入参数
+          if (-not (Test-Path "build_release.py")) {
+            Write-Host "::error::build_release.py 不存在, 当前目录: $(Get-Location)"
+            exit 1
+          }
+          Write-Host "OK: build_release.py 存在"
+
+      - name: 构建 zip (带详细错误)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          # 确定版本号
           if ($env:GITHUB_REF_TYPE -eq 'tag') {
             $version = $env:GITHUB_REF_NAME -replace '^v', ''
           } else {
             $version = '${{ inputs.version }}'
           }
           Write-Host "Building version: $version"
-          python build_release.py --version $version
+          Write-Host ""
 
-      - name: 显示 zip 内容预览
+          # 设置 UTF-8 (Windows 默认 GBK 会导致中文乱码/错误)
+          $env:PYTHONIOENCODING = "utf-8"
+          $env:PYTHONUTF8 = "1"
+
+          # 跑构建, 失败时显示错误
+          try {
+            python build_release.py --version $version
+            Write-Host ""
+            Write-Host "=== Build OK ==="
+          } catch {
+            Write-Host "::error::构建失败: $_"
+            Write-Host "=== Retry with verbose output ==="
+            python build_release.py --version $version
+            exit 1
+          }
+
+          # 验证 zip 生成
+          $zip = Get-ChildItem -Path "dist/*.zip" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $zip) {
+            Write-Host "::error::未生成 zip 文件"
+            exit 1
+          }
+          Write-Host "Zip: $($zip.FullName) ($($zip.Length) bytes)"
+
+      - name: 显示 zip 内容
         shell: pwsh
         run: |
-          $zipFile = Get-ChildItem -Path dist/*.zip | Select-Object -First 1
+          $zipFile = Get-ChildItem -Path "dist/*.zip" | Select-Object -First 1
           Write-Host "=== ZIP info ==="
           Write-Host "Name: $($zipFile.Name)"
           Write-Host "Size: $($zipFile.Length) bytes"
           Write-Host ""
-          Write-Host "=== Contents (top 10) ==="
+          Write-Host "=== Contents (前 12 项) ==="
           Add-Type -AssemblyName System.IO.Compression.FileSystem
           $zip = [System.IO.Compression.ZipFile]::OpenRead($zipFile.FullName)
-          $zip.Entries | Select-Object -First 10 | ForEach-Object { Write-Host "  $($_.FullName)" }
+          $zip.Entries | Select-Object -First 12 | ForEach-Object {
+            Write-Host "  $($_.FullName)  ($($_.Length) bytes)"
+          }
           $zip.Dispose()
 
       - name: 上传构建产物
@@ -77,7 +123,7 @@ jobs:
           name: ${{ github.ref_name }}
           draft: false
           prerelease: false
-          generate_release_notes: true   # 自动生成变更日志 (从 PR/commit)
+          generate_release_notes: true
           files: |
             dist/*.zip
         env:

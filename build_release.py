@@ -1,7 +1,7 @@
 """生成可分发的 zip 包 (用于 GitHub Releases)。
 
 用法:
-    py build_release.py                 # 默认打包当前目录到 dist/llama-router-setup-v0.1.0.zip
+    py build_release.py                 # 默认打包当前目录到 dist/llama-router-setup-v0.0.1.zip
     py build_release.py --version 1.2.3 --output /tmp/release.zip
     py build_release.py --no-config     # 不带 config.example.json (更精简)
 
@@ -16,6 +16,13 @@ import os
 import sys
 import zipfile
 from pathlib import Path
+
+# 强制 UTF-8 输出 (避免在 Windows GBK 控制台下乱码/UnicodeEncodeError)
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+except Exception:
+    pass
 
 # 这些路径/文件**不会**被打包
 EXCLUDE_DIRS = {
@@ -83,7 +90,7 @@ def collect_files(project_root: Path) -> list:
 
 
 def get_version(version_arg: str | None) -> str:
-    """确定版本号: 命令行参数 > 从 VERSION 文件读 > 从 git tag 读 > 默认 0.1.0。"""
+    """确定版本号: 命令行参数 > 从 VERSION 文件读 > 从 git tag 读 > 默认 0.0.1。"""
     if version_arg:
         return version_arg
     # 从 VERSION 文件
@@ -104,7 +111,7 @@ def get_version(version_arg: str | None) -> str:
             return tag.lstrip("v")
     except Exception:
         pass
-    return "0.1.0"
+    return "0.0.1"
 
 
 def build_zip(project_root: Path, version: str, output: Path,
