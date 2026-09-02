@@ -20,6 +20,7 @@ config.example.json.local
 # 运行时生成的日志和预设
 logs/
 router-preset.ini
+dist/
 
 # 临时文件
 *.tmp

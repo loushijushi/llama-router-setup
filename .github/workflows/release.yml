@@ -1,0 +1,93 @@
+name: Build and Release
+
+# 当推送 v* 格式的 tag (如 v1.0.0, v0.1.0) 时自动触发
+on:
+  push:
+    tags:
+      - 'v*'
+  # 也允许在 GitHub 网页上手动触发 (Actions -> Run workflow)
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '版本号 (如 1.0.0, 不带 v 前缀)'
+        required: true
+        default: '0.1.0'
+
+permissions:
+  contents: write   # 创建 release 需要写权限
+
+jobs:
+  build:
+    name: Build release zip
+    runs-on: windows-latest   # 必须是 Windows, 我们的项目只能在 Windows 运行
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 设置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 显示环境信息
+        shell: pwsh
+        run: |
+          Write-Host "OS: $env:RUNNER_OS"
+          Write-Host "Python: $(python --version)"
+          Write-Host "Tag: $env:GITHUB_REF_NAME"
+          Write-Host "Repo: $env:GITHUB_REPOSITORY"
+
+      - name: 构建 zip
+        shell: pwsh
+        run: |
+          # 优先用 tag 名 (去掉 v 前缀), 手动触发用输入参数
+          if ($env:GITHUB_REF_TYPE -eq 'tag') {
+            $version = $env:GITHUB_REF_NAME -replace '^v', ''
+          } else {
+            $version = '${{ inputs.version }}'
+          }
+          Write-Host "Building version: $version"
+          python build_release.py --version $version
+
+      - name: 显示 zip 内容预览
+        shell: pwsh
+        run: |
+          $zipFile = Get-ChildItem -Path dist/*.zip | Select-Object -First 1
+          Write-Host "=== ZIP info ==="
+          Write-Host "Name: $($zipFile.Name)"
+          Write-Host "Size: $($zipFile.Length) bytes"
+          Write-Host ""
+          Write-Host "=== Contents (top 10) ==="
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $zip = [System.IO.Compression.ZipFile]::OpenRead($zipFile.FullName)
+          $zip.Entries | Select-Object -First 10 | ForEach-Object { Write-Host "  $($_.FullName)" }
+          $zip.Dispose()
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-zip
+          path: dist/*.zip
+          if-no-files-found: error
+
+      - name: 创建 GitHub Release 并上传 zip
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          draft: false
+          prerelease: false
+          generate_release_notes: true   # 自动生成变更日志 (从 PR/commit)
+          files: |
+            dist/*.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 验证 release 已发布
+        shell: pwsh
+        run: |
+          Write-Host ""
+          Write-Host "============================================="
+          Write-Host "Release $env:GITHUB_REF_NAME 发布完成!"
+          Write-Host "下载: https://github.com/$env:GITHUB_REPOSITORY/releases/tag/$env:GITHUB_REF_NAME"
+          Write-Host "============================================="

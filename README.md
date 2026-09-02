@@ -8,6 +8,18 @@
 - 🛡️ 显存守护 watchdog（GPU 紧张时自动休眠释放）
 - 🌍 支持新电脑从零环境搭建（缺啥自动装）
 
+## 📥 下载安装
+
+前往 [**Releases 页面**](https://github.com/loushijushi/llama-router-setup/releases) 下载最新版本的 zip 包：
+
+```
+llama-router-setup-v1.0.0.zip
+```
+
+解压后双击 `manager-ui.bat` 即可。首次运行会自动检查环境并引导补齐缺失的依赖。
+
+> 没有 git / Python 经验？直接下载 zip 是最简单的安装方式。
+
 ## ✨ 功能特性
 
 | 功能 | 说明 |
@@ -137,6 +149,38 @@ A: 当前 `models_max=1`，模型按需加载（旧模型自动 sleep 释放显�
 A: 「模型」页勾上 `reasoning` 参数，值 `off`（实际效果取决于模型，部分模型会忽略）。
 
 更多问题见 `安装指南.txt` 或在 UI 里点「❓ 帮助」。
+
+## 🛠️ 开发与发布
+
+只对项目维护者/贡献者有意义。
+
+**克隆开发版**:
+```bash
+git clone https://github.com/loushijushi/llama-router-setup.git
+cd llama-router-setup
+```
+
+**打 zip 包** (用于本地测试):
+```bash
+py build_release.py                 # 默认版本 0.1.0
+py build_release.py --version 1.2.3
+```
+输出在 `dist/` 目录。
+
+**发布新版本到 GitHub Releases**:
+1. 修改 `VERSION` 文件 (或 git tag 携带版本号)
+2. 推送 tag:
+   ```bash
+   git tag v1.0.0
+   git push --tags
+   ```
+3. GitHub Actions 自动:
+   - 在 Windows runner 上构建 zip
+   - 创建 Release (含自动生成的 changelog)
+   - 上传 zip 作为 binary
+4. 几分钟后在 https://github.com/loushijushi/llama-router-setup/releases 看到
+
+CI 还会对每个 PR / push 检查 Python 语法、CRLF 行尾、`.gitignore` 覆盖、必需文件存在等。
 
 ## 📜 许可证
 
