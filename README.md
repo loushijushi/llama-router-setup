@@ -43,22 +43,34 @@ llama-router-setup-v1.0.0.zip
 
 ### 安装
 
-1. **下载本项目**
+1. **下载 zip 包** (推荐大多数用户)
+   - 去 [Releases](https://github.com/loushijushi/llama-router-setup/releases) 下载最新版本
+   - 解压到任意目录 (如 `D:\llama-router-setup\`)
+   - 双击 `manager-ui.bat` 启动
+
+   或用 git:
    ```bash
-   git clone https://github.com/你的用户名/llama-router-setup.git
+   git clone https://github.com/loushijushi/llama-router-setup.git
    cd llama-router-setup
    ```
 
-2. **第一次运行**（会自动检查环境）
+2. **首次运行** (UI 会弹出向导引导你)
    - 双击 `manager-ui.bat`
-   - 首次打开「环境」标签页，按提示安装/补齐依赖
-   - 在「全局」页设置 `llama_dir`（指向你的 llama.cpp 目录）
-   - 在「模型」页添加模型条目
-   - 在「服务」页点「安装」注册 Windows 服务
+   - **环境检查**：「环境」标签页会列出所有依赖状态, 缺什么点「修复」自动装
+   - **设置 llama.cpp 目录**：「全局」标签页 → 「llama.cpp 安装目录」选你电脑上的 llama.cpp 根目录 (含 `llama-server.exe`)
+   - **添加模型**：「模型」标签页 → 左侧点「新增」→ 选你的 `.gguf` 文件
+   - **启动服务**：「服务」标签页 → 点「安装」→ 点「启动」
 
 3. **日常使用**
    - 双击 `manager-ui.bat` 启动管理界面
    - 点「📊 实时监控」查看实时日志和模型状态
+
+### 配置说明
+
+- `config.json` (首次运行自动生成, 不会入库) 存你的所有配置
+- `config.example.json` 是模板, 仅作参考
+- 你可以**手动编辑** `config.json` 或在 UI 里改, 效果一样
+- `logs/` 目录存服务运行日志, 不入库
 
 ### 详细文档
 

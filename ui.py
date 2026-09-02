@@ -1271,6 +1271,37 @@ class App(tk.Tk):
         self._refresh_env()
         self._poll_status()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+        # 首次运行向导 (空配置时)
+        self.after(500, self._first_run_wizard)
+
+    def _first_run_wizard(self) -> None:
+        """首次运行/配置为空时, 弹出向导引导用户设置 llama_dir 和添加模型。"""
+        try:
+            ld = (self.cfg.get("llama_dir") or "").rstrip("\\/")
+            models = [m for m in self.cfg.get("models", []) if m.get("enabled", True)]
+            # 已有完整配置就不打扰
+            if ld and os.path.isdir(ld) and models:
+                return
+            # 没有任何配置 -> 弹窗
+            if not ld or not os.path.isdir(ld):
+                if not messagebox.askyesno(
+                    "首次运行向导",
+                    "看起来是首次运行, 需要先设置 llama.cpp 安装目录 (含 llama-server.exe).\n\n"
+                    "是否现在打开「全局」页面设置?",
+                ):
+                    return
+                self.nb.select(2)  # 切到「全局」tab
+                return
+            if not models:
+                if not messagebox.askyesno(
+                    "首次运行向导",
+                    f"llama_dir 已设置 ({ld}), 但还没有配置模型.\n\n"
+                    "是否现在打开「模型」页面添加模型?",
+                ):
+                    return
+                self.nb.select(1)  # 切到「模型」tab
+        except Exception:
+            pass
 
     def _on_close(self) -> None:
         if messagebox.askyesno("退出", "确定要退出吗？\n（服务仍会在后台运行）"):
@@ -1537,6 +1568,14 @@ class App(tk.Tk):
     def _build_models_tab(self) -> None:
         f = ttk.Frame(self.nb, padding=8)
         self.nb.add(f, text="模型")
+        # 顶部橙色提示条 (强调要点击下方「新增」按钮)
+        top_bar = tk.Frame(f, bg="#FFA500", height=36)
+        top_bar.pack(fill=tk.X, side=tk.TOP, pady=(0, 8))
+        top_bar.pack_propagate(False)
+        tk.Label(top_bar, text="  👉 在左侧点「新增」添加你的 .gguf 模型, 或点击「删除」移除已有模型",
+                 bg="#FFA500", fg="white", font=("Segoe UI", 10, "bold"),
+                 anchor=tk.W).pack(side=tk.LEFT, fill=tk.Y)
+
         paned = ttk.PanedWindow(f, orient=tk.HORIZONTAL)
         paned.pack(fill=tk.BOTH, expand=True)
 
