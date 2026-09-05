@@ -1290,7 +1290,7 @@ class App(tk.Tk):
                     "是否现在打开「全局」页面设置?",
                 ):
                     return
-                self.nb.select(2)  # 切到「全局」tab
+                self.nb.select(1)  # 切到「全局」tab
                 return
             if not models:
                 if not messagebox.askyesno(
@@ -1299,7 +1299,7 @@ class App(tk.Tk):
                     "是否现在打开「模型」页面添加模型?",
                 ):
                     return
-                self.nb.select(1)  # 切到「模型」tab
+                self.nb.select(2)  # 切到「模型」tab
         except Exception:
             pass
 
@@ -1316,11 +1316,12 @@ class App(tk.Tk):
 
         self.nb = ttk.Notebook(self)
         self.nb.pack(fill=tk.BOTH, expand=True, padx=8, pady=4)
-        self._build_env_tab()
+        # 标签顺序: 服务(0) / 全局(1) / 模型(2) / 偏好(3) / 环境(4)
         self._build_service_tab()
-        self._build_models_tab()
         self._build_global_tab()
+        self._build_models_tab()
         self._build_prefs_tab()
+        self._build_env_tab()
         self.nb.bind("<<NotebookTabChanged>>", self._on_tab_changed)
 
         bar = ttk.Frame(self, padding=(8, 4))
@@ -1332,9 +1333,10 @@ class App(tk.Tk):
 
     def _on_tab_changed(self, _evt) -> None:
         current = self.nb.index(self.nb.select())
-        if current == 0:
+        # 标签顺序: 服务(0) / 全局(1) / 模型(2) / 偏好(3) / 环境(4)
+        if current == 4:  # 环境
             self._refresh_env()
-        elif current in (2, 3):  # models=2, global=3
+        elif current in (1, 2):  # 全局 / 模型
             for p in self._param_panels:
                 p.reload()
 
@@ -1622,15 +1624,21 @@ class App(tk.Tk):
         self.var_model = tk.StringVar()
         self.var_mmproj = tk.StringVar()
         self.var_enabled = tk.BooleanVar(value=True)
+        self.var_base_url = tk.StringVar()   # API 端点 (留空表示用本机 llama.cpp)
+        self.var_api_key = tk.StringVar()    # API 密钥 (留空表示无)
+        # (label, var, browse_ft, kind)  kind: "text" / "password"
         rows = [
-            ("模型 ID (段名)", self.var_id, None, "model"),
-            ("API 别名 alias", self.var_alias, None, "model"),
-            ("主模型文件 (.gguf)", self.var_model, "gguf", "model"),
-            ("多模态 mmproj (可选)", self.var_mmproj, "gguf", "model"),
+            ("模型 ID (必填)", self.var_id, None, "text"),
+            ("API 别名 alias", self.var_alias, None, "text"),
+            ("主模型文件 (.gguf)", self.var_model, "gguf", "text"),
+            ("多模态 mmproj (可选)", self.var_mmproj, "gguf", "text"),
+            ("API 端点 base_url (可选, 留空=本机)", self.var_base_url, None, "text"),
+            ("API 密钥 api_key  (可选, 留空=无)", self.var_api_key, None, "password"),
         ]
-        for i, (label, var, browse_ft, _) in enumerate(rows):
+        for i, (label, var, browse_ft, kind) in enumerate(rows):
             ttk.Label(box1, text=label + ":").grid(row=i, column=0, sticky=tk.W, pady=3, padx=(0, 6))
-            ttk.Entry(box1, textvariable=var).grid(row=i, column=1, sticky=tk.EW, pady=3)
+            show = "*" if kind == "password" else ""
+            ttk.Entry(box1, textvariable=var, show=show).grid(row=i, column=1, sticky=tk.EW, pady=3)
             if browse_ft:
                 ttk.Button(box1, text="浏览...",
                            command=lambda v=var: self._browse(v, browse_ft)).grid(row=i, column=2, padx=4)
@@ -1729,6 +1737,8 @@ class App(tk.Tk):
         self.var_alias.set(m.get("alias", ""))
         self.var_model.set(m.get("model", ""))
         self.var_mmproj.set(m.get("mmproj", ""))
+        self.var_base_url.set(m.get("base_url", ""))
+        self.var_api_key.set(m.get("api_key", ""))
         self.var_enabled.set(bool(m.get("enabled", True)))
         self.var_draft_model.set(m.get("draft_model", ""))
         self.var_draft_type.set(m.get("draft_type", ""))
@@ -1762,6 +1772,7 @@ class App(tk.Tk):
             idx += 1
             new_id = f"{base}-{idx}"
         m = {"id": new_id, "alias": new_id, "model": "", "mmproj": "",
+             "base_url": "", "api_key": "",
              "draft_model": "", "draft_type": "",
              "draft_n_max": "3", "draft_n_min": "0",
              "draft_p_split": "0.1", "draft_p_min": "0.0", "draft_ngl": "auto",
@@ -1797,7 +1808,7 @@ class App(tk.Tk):
     def _on_save_model(self) -> None:
         sel = self.model_list.curselection()
         if not sel:
-            messagebox.showinfo("提示", "请先选中一个模型")
+            messagebox.showinfo("提示", "请先选择一个模型")
             return
         idx = sel[0]
         m = self.cfg["models"][idx]
@@ -1805,6 +1816,8 @@ class App(tk.Tk):
         m["alias"] = self.var_alias.get().strip()
         m["model"] = self.var_model.get().strip()
         m["mmproj"] = self.var_mmproj.get().strip()
+        m["base_url"] = self.var_base_url.get().strip()   # 留空表示用本机
+        m["api_key"] = self.var_api_key.get().strip()     # 留空表示无
         m["enabled"] = bool(self.var_enabled.get())
         m["draft_model"] = self.var_draft_model.get().strip()
         m["draft_type"] = self.var_draft_type.get().strip()
@@ -1813,7 +1826,7 @@ class App(tk.Tk):
         m["draft_p_split"] = self.var_draft_p_split.get().strip() or "0.1"
         m["draft_p_min"] = self.var_draft_p_min.get().strip() or "0.0"
         m["draft_ngl"] = self.var_draft_ngl.get().strip() or "auto"
-        # 同步到 params 字典 (供 generate_preset 写 ini 使用)
+        # 同步到 params 字典 (给 generate_preset 写 ini 使用)
         params = m.setdefault("params", {})
         if m["draft_model"]:
             params["spec-draft-model"] = {"enabled": True, "value": m["draft_model"]}

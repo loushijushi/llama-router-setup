@@ -1,7 +1,5 @@
 {
     "_comment": "这是 config.json 模板. 首次运行后会自动复制为 config.json, 在 UI 里改 llama_dir 和 model 路径, 或手动编辑.",
-    "_hint_llama_dir": "改成你电脑上 llama.cpp 完整安装目录, 必须包含 llama-server.exe",
-    "_hint_models": "model: 改成你的 .gguf 模型文件绝对路径. mmproj: 多模态模型才需要, 否则留空",
 
     "llama_dir": "C:\\\\llama.cpp",
     "host": "0.0.0.0",
@@ -10,7 +8,6 @@
     "sleep_idle_seconds": 3600,
 
     "watchdog": {
-        "_hint": "显存守护, GPU 显存不足时自动 unload 模型释放资源",
         "enabled": false,
         "free_mb_threshold": 2048,
         "check_interval_seconds": 10,
@@ -19,11 +16,13 @@
 
     "models": [
         {
-            "_hint": "在「模型」标签页添加/修改模型, 比手改 JSON 方便. 必填 id/model, 选填 alias/mmproj/draft_*",
+            "_comment_fields": "id 必填; model 必填 (绝对路径); mmproj/base_url/api_key/draft_* 都可选",
             "id": "my-model",
             "alias": "m",
             "model": "C:\\\\path\\\\to\\\\your-model.gguf",
             "mmproj": "",
+            "base_url": "",
+            "api_key": "",
             "draft_model": "",
             "draft_type": "",
             "draft_n_max": 3,
