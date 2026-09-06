@@ -1642,6 +1642,8 @@ class App(tk.Tk):
         self.var_enabled = tk.BooleanVar(value=True)
         self.var_base_url = tk.StringVar()   # API 端点 (留空表示用本机 llama.cpp)
         self.var_api_key = tk.StringVar()    # API 密钥 (留空表示无)
+        self.var_api_key_visible = tk.BooleanVar(value=False)  # 控制密码显示/隐藏
+        self._api_key_entry = None  # 保存 Entry 引用用于切换显示/隐藏
         # 2 列布局: row 0 是 ID/alias, row 1 是 model/mmproj, row 2 是 base_url/api_key
         # (row, col, label, var, browse_ft, kind)
         info_rows = [
@@ -1659,6 +1661,11 @@ class App(tk.Tk):
             show = "*" if kind == "password" else ""
             entry = ttk.Entry(sub, textvariable=var, show=show)
             entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 0))
+            if kind == "password":
+                # 保存 Entry 引用用于切换显示/隐藏
+                self._api_key_entry = entry
+                ttk.Button(sub, text="👁", width=3,
+                           command=self._toggle_api_key).pack(side=tk.LEFT, padx=(2, 0))
             if browse_ft:
                 ttk.Button(sub, text="…",
                            command=lambda v=var: self._browse(v, browse_ft)).pack(side=tk.LEFT, padx=(2, 0))
@@ -1773,6 +1780,13 @@ class App(tk.Tk):
             path = filedialog.askopenfilename()
         if path:
             var.set(path)
+
+    def _toggle_api_key(self) -> None:
+        """切换 API Key 密码显示/隐藏"""
+        visible = not self.var_api_key_visible.get()
+        self.var_api_key_visible.set(visible)
+        if self._api_key_entry:
+            self._api_key_entry.configure(show="" if visible else "*")
 
     def _on_select_model(self, _evt=None) -> None:
         sel = self.model_list.curselection()
@@ -1953,6 +1967,14 @@ class App(tk.Tk):
         inner.bind("<Button-4>", _wheel, add="+")
         inner.bind("<Button-5>", _wheel, add="+")
 
+        # 顶部保存按钮 (与模型编辑器的保存位置对应) — 右上角
+        top_save = ttk.Frame(f)
+        top_save.pack(fill=tk.X, pady=(0, 4))
+        ttk.Label(top_save, text="提示: 改完点右上角「保存」会写 config.json + router-preset.ini 并触发后台保存",
+                  foreground="#666").pack(side=tk.LEFT, padx=4)
+        ttk.Button(top_save, text="💾  保存全局配置",
+                   command=self._on_save_global).pack(side=tk.RIGHT, padx=4)
+
         f_content = ttk.Frame(inner, padding=10)
         f_content.pack(fill=tk.X, expand=True)
 
@@ -2011,12 +2033,11 @@ class App(tk.Tk):
                        command=lambda p=path: self._open_file(p)).grid(row=i, column=2, padx=4, pady=2)
         box_files.columnconfigure(1, weight=1)
 
-        # 固定底栏 (始终可见)
+        # 底栏提示文字 (无保存按钮 — 保存在顶部右上角)
         bottom = ttk.Frame(f, padding=(10, 6, 10, 6), relief=tk.RAISED, borderwidth=1)
         bottom.pack(fill=tk.X, side=tk.BOTTOM)
-        ttk.Label(bottom, text="提示: 改完点「保存」会写 config.json + router-preset.ini 并触发后台保存。",
+        ttk.Label(bottom, text="提示: 改完点右上角「💾 保存」会写 config.json + router-preset.ini 并触发后台保存。",
                   foreground="#666").pack(side=tk.LEFT, padx=4)
-        ttk.Button(bottom, text="💾  保存全局配置", command=self._on_save_global).pack(side=tk.RIGHT, padx=4)
 
     def _browse_dir(self, var: tk.StringVar) -> None:
         d = filedialog.askdirectory()
