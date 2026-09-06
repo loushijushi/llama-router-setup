@@ -1675,9 +1675,9 @@ class App(tk.Tk):
         # 占 0 空间, 给参数面板更多位置
         draft_toggle_bar = ttk.Frame(master)
         draft_toggle_bar.pack(fill=tk.X, padx=4, pady=(0, 2))
-        self._draft_collapsed = tk.BooleanVar(value=True)
+        self._draft_collapsed = tk.BooleanVar(value=False)
         ttk.Checkbutton(draft_toggle_bar,
-                        text="▸  推测解码 (Draft Model)  —— MTP / DFlash (点此展开, 一般用不到)",
+                        text="▾  推测解码 (Draft Model)  —— MTP / DFlash (点此折叠)",
                         variable=self._draft_collapsed,
                         command=self._toggle_draft_box
                         ).pack(side=tk.LEFT)
@@ -1721,6 +1721,9 @@ class App(tk.Tk):
         ttk.Label(self.draft_box, text="(auto 自动, 0 纯 CPU, 99 全 GPU)",
                   foreground="#888").grid(row=4, column=2, columnspan=2, padx=4, sticky=tk.W)
         self.draft_box.columnconfigure(1, weight=1)
+        # 默认展开: 立刻 pack 一次 (如果默认 False, 用户需要在 _toggle_draft_box 手动调)
+        if not self._draft_collapsed.get():
+            self.draft_box.pack(fill=tk.X, padx=4, pady=(0, 4))
 
     def _build_model_params_panel(self, master: ttk.Frame) -> None:
         """右侧面板: 仅显示模型参数 (占满全部高度)。"""
