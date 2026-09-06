@@ -24,6 +24,8 @@ jobs:
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # 完整 git 历史, 用于生成 release notes
 
       - name: 设置 Python
         uses: actions/setup-python@v5
@@ -55,6 +57,78 @@ jobs:
             exit 1
           }
           Write-Host "OK: build_release.py 存在"
+
+      - name: 生成 release notes (从 CHANGELOG.md + git log)
+        id: release_notes
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          if ($env:GITHUB_REF_TYPE -eq 'tag') {
+            $version = $env:GITHUB_REF_NAME -replace '^v', ''
+          } else {
+            $version = '${{ inputs.version }}'
+          }
+          Write-Host "Generating release notes for v$version"
+          Write-Host ""
+
+          # 1. 从 CHANGELOG.md 提取对应版本段
+          $changelog = ""
+          if (Test-Path "CHANGELOG.md") {
+            $content = Get-Content "CHANGELOG.md" -Raw -Encoding UTF8
+            # 找 ## [version] 段, 一直到下一个 --- 或 ## [
+            $pattern = "(?ms)##\s*\[$([regex]::Escape($version))[^\n]*\n(.*?)(?=\n---\n|\n##\s*\[|$)"
+            $match = [regex]::Match($content, $pattern)
+            if ($match.Success) {
+              $changelog = $match.Groups[1].Value.Trim()
+              Write-Host "  -> CHANGELOG.md 找到 v$version 段, $(($changelog -split "`n").Count) 行"
+            } else {
+              Write-Host "  -> CHANGELOG.md 没找到 v$version 段"
+            }
+          } else {
+            Write-Host "  -> CHANGELOG.md 不存在"
+          }
+
+          # 2. 从 git log 拿 commits (作为补充)
+          $commits = ""
+          $lastTag = git describe --tags --abbrev=0 2>$null
+          if ($LASTEXITCODE -eq 0) {
+            $logOut = git log "$lastTag..HEAD" --pretty=format:"- %s" 2>$null
+            if ($logOut) {
+              $commits = "`n### Git Commits since $lastTag`n`n$logOut"
+              Write-Host "  -> $(($logOut -split "`n").Count) 个 git commits"
+            }
+          }
+
+          # 3. 拼装最终 release notes
+          $notes = "# llama.cpp Router 管理工具 v$version`n`n"
+          if ($changelog) {
+            $notes += "## 更新内容`n`n$changelog`n"
+          } else {
+            $notes += "## 更新内容`n`n详见 [CHANGELOG.md](https://github.com/$env:GITHUB_REPOSITORY/blob/main/CHANGELOG.md) 和 [commit history](https://github.com/$env:GITHUB_REPOSITORY/commits/v$version)。`n"
+          }
+          if ($commits) {
+            $notes += $commits
+          }
+          $notes += "`n## 下载和使用`n`n"
+          $notes += "1. 下载下面的 `llama-router-setup-v$version.zip` 并解压到任意目录`n"
+          $notes += "2. 双击 `manager-ui.bat` 启动管理界面`n"
+          $notes += "3. 首次启动会自动检查环境并引导你设置 llama_dir 和添加模型`n"
+          $notes += "4. 在「服务」标签页点「安装」注册 Windows 服务, 开机自启`n"
+          $notes += "`n## 系统要求`n`n"
+          $notes += "- Windows 10/11`n"
+          $notes += "- Python 3.8+ (含 tkinter)`n"
+          $notes += "- llama.cpp (含 llama-server.exe)`n"
+          $notes += "- .gguf 模型文件`n"
+
+          # 写到 GITHUB_OUTPUT 供下一步用
+          $notes | Out-File -FilePath "$env:GITHUB_OUTPUT" -Encoding UTF8 -Append
+          Add-Content -Path "$env:GITHUB_OUTPUT" -Value "release_notes<<EOF"
+          Add-Content -Path "$env:GITHUB_OUTPUT" -Value $notes
+          Add-Content -Path "$env:GITHUB_OUTPUT" -Value "EOF"
+          Write-Host ""
+          Write-Host "=== Release notes (前 30 行) ==="
+          ($notes -split "`n")[0..29] | ForEach-Object { Write-Host "  $_" }
 
       - name: 构建 zip (带详细错误)
         shell: pwsh
@@ -123,7 +197,8 @@ jobs:
           name: ${{ github.ref_name }}
           draft: false
           prerelease: false
-          generate_release_notes: true
+          generate_release_notes: false   # 我们自己生成, 不用 GitHub 默认的
+          body: ${{ steps.release_notes.outputs.release_notes }}
           files: |
             dist/*.zip
         env:

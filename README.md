@@ -14,10 +14,10 @@
 
 ## 📥 下载安装
 
-去 [**Releases 页面**](https://github.com/loushijushi/llama-router-setup/releases) 下载最新 zip 包（当前 `v0.0.2`，约 200 KB）：
+去 [**Releases 页面**](https://github.com/loushijushi/llama-router-setup/releases) 下载最新版本的 zip 包（当前 `v0.0.5`，约 200 KB）：
 
 ```
-llama-router-setup-v0.0.2.zip
+llama-router-setup-v0.0.5.zip
 ```
 
 解压到任意目录（**不要**有中文路径），双击 `manager-ui.bat` 即可。
@@ -211,7 +211,7 @@ A: 在「模型」页勾上 `reasoning` 参数，值 `off`。⚠️ 注意：**Q
 A: 等几秒让首次 HTTP 轮询完成（`/v1/models`），之后悬停会显示 tooltip。
 
 **Q: 双击 `manager-ui.bat` 弹出一个 cmd 窗口？**
-A: 现在的版本用 VBS 静默启动，**不会**弹 cmd 窗口。如果还弹，请确认你用的是 `v0.0.2+` 版本。
+A: 现在的版本用 VBS 静默启动，**不会**弹 cmd 窗口。如果还弹，请确认你用的是最新版。
 
 **Q: 路径里有中文/空格会出问题吗？**
 A: 项目目录路径有中文一般没事，但**强烈建议安装到纯英文路径**（如 `D:\llama-router-setup\`），避免 NSSM 解析异常。
@@ -250,7 +250,7 @@ py build_release.py --no-config     # 不带 config.example.json
    ```
 3. 推 tag 触发自动发布：
    ```bash
-   git tag v0.0.3
+    git tag v0.0.5
    git push --tags
    ```
 4. GitHub Actions 自动：
@@ -271,7 +271,22 @@ py build_release.py --no-config     # 不带 config.example.json
   - `.gitignore` 覆盖关键文件
   - 必需文件存在
 
-- **Release** (`.github/workflows/release.yml`): 推 tag 时自动打包发布
+- **Release** (`.github/workflows/release.yml`): 推 tag 时自动
+  - 用 `build_release.py` 打包 zip
+  - 从 `CHANGELOG.md` 自动提取本次版本的更新内容作为 release notes
+  - 同时列出 git commits (作为补充)
+  - 创建 GitHub Release + 上传 zip
+
+### 发布前检查
+
+发布前跑 `py pre_publish_check.py` 自动检查:
+- VERSION 文件是否已递增
+- README 中是否有过时内容
+- CHANGELOG.md 中是否有本次版本条目
+- 工作区是否干净 (无未提交修改)
+- 加 `--auto-fix` 可自动从 git log 生成 CHANGELOG [Unreleased] 段
+
+每个版本的详细变更见 [CHANGELOG.md](CHANGELOG.md)。
 
 ## 📜 许可证
 

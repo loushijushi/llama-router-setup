@@ -1578,45 +1578,59 @@ class App(tk.Tk):
                  bg="#FFA500", fg="white", font=("Segoe UI", 10, "bold"),
                  anchor=tk.W).pack(side=tk.LEFT, fill=tk.Y)
 
+        # 左右分栏: 左 = 模型列表 + 基础信息 (上下排列), 右 = 模型参数 (占满)
         paned = ttk.PanedWindow(f, orient=tk.HORIZONTAL)
         paned.pack(fill=tk.BOTH, expand=True)
 
+        # ===== 左侧 (模型列表 + 基础信息) =====
         left = ttk.Frame(paned, padding=(0, 0, 6, 0))
         paned.add(left, weight=1)
+        # 模型列表
         ttk.Label(left, text="已配置模型:").pack(anchor=tk.W)
-        self.model_list = tk.Listbox(left, height=18, exportselection=False,
+        list_frame = ttk.Frame(left)
+        list_frame.pack(fill=tk.X, pady=(2, 4))
+        self.model_list = tk.Listbox(list_frame, height=6, exportselection=False,
                                      font=("Consolas", 10))
-        self.model_list.pack(fill=tk.BOTH, expand=True, pady=(2, 4))
+        self.model_list.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self.model_list.bind("<<ListboxSelect>>", self._on_select_model)
+        lb_sb = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=self.model_list.yview)
+        lb_sb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.model_list.config(yscrollcommand=lb_sb.set)
+        # 增删上下移按钮 (一行)
         lb_btns = ttk.Frame(left)
-        lb_btns.pack(fill=tk.X)
-        ttk.Button(lb_btns, text="新增", command=self._on_add_model).pack(
-            side=tk.LEFT, expand=True, fill=tk.X)
-        ttk.Button(lb_btns, text="删除", command=self._on_del_model).pack(
-            side=tk.LEFT, expand=True, fill=tk.X)
-        ttk.Button(lb_btns, text="上移", command=lambda: self._move(-1)).pack(
-            side=tk.LEFT, expand=True, fill=tk.X)
-        ttk.Button(lb_btns, text="下移", command=lambda: self._move(1)).pack(
-            side=tk.LEFT, expand=True, fill=tk.X)
+        lb_btns.pack(fill=tk.X, pady=(0, 6))
+        for label, cmd in [
+            ("新增", self._on_add_model),
+            ("删除", self._on_del_model),
+            ("上移", lambda: self._move(-1)),
+            ("下移", lambda: self._move(1)),
+        ]:
+            ttk.Button(lb_btns, text=label, command=cmd).pack(
+                side=tk.LEFT, expand=True, fill=tk.X, padx=1)
+        # 分隔线
+        ttk.Separator(left, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=(0, 6))
+        # 编辑器 (基础信息 + 推测解码) 在左侧下面
+        self._build_model_editor(left)
 
+        # ===== 右侧 (模型参数 - 占满全部高度) =====
         right = ttk.Frame(paned)
-        paned.add(right, weight=4)
+        paned.add(right, weight=3)
         self.model_right = right
-        self._build_model_editor(right)
+        self._build_model_params_panel(right)
 
     def _build_model_editor(self, master: ttk.Frame) -> None:
         self._editor_master = master  # 保存引用供 _toggle_draft_box 用
         # 顶部醒目保存条 (改动后容易注意到)
-        top_bar = tk.Frame(master, bg="#FFA500", height=36)
-        top_bar.pack(fill=tk.X, padx=4, pady=(4, 4), side=tk.TOP)
+        top_bar = tk.Frame(master, bg="#FFA500", height=32)
+        top_bar.pack(fill=tk.X, padx=4, pady=(0, 4), side=tk.TOP)
         top_bar.pack_propagate(False)
-        tk.Label(top_bar, text="⚠  修改后必须点「保存」才能写入 config.json + router-preset.ini ！",
-                 bg="#FFA500", fg="black", font=("", 10, "bold")).pack(side=tk.LEFT, padx=10, pady=4)
-        tk.Button(top_bar, text="💾  保存模型配置",
-                  bg="#FF6B35", fg="white", font=("", 10, "bold"),
+        tk.Label(top_bar, text="⚠  修改后必须点「保存」",
+                 bg="#FFA500", fg="black", font=("", 9, "bold")).pack(side=tk.LEFT, padx=10, pady=4)
+        tk.Button(top_bar, text="💾  保存",
+                  bg="#FF6B35", fg="white", font=("", 9, "bold"),
                   activebackground="#FF8C5A", activeforeground="white",
-                  relief=tk.RAISED, bd=2, padx=16, pady=2,
-                  command=self._on_save_model).pack(side=tk.RIGHT, padx=10, pady=4)
+                  relief=tk.RAISED, bd=2, padx=12, pady=2,
+                  command=self._on_save_model).pack(side=tk.RIGHT, padx=10, pady=2)
 
         # ===== 基础信息 (2 列紧凑布局) =====
         box1 = ttk.LabelFrame(master, text="基础信息", padding=6)
@@ -1708,9 +1722,10 @@ class App(tk.Tk):
                   foreground="#888").grid(row=4, column=2, columnspan=2, padx=4, sticky=tk.W)
         self.draft_box.columnconfigure(1, weight=1)
 
-        # ===== 模型参数 (占剩余所有空间) =====
-        box3 = ttk.LabelFrame(master, text="模型参数", padding=6)
-        box3.pack(fill=tk.BOTH, expand=True, padx=4, pady=(0, 4))
+    def _build_model_params_panel(self, master: ttk.Frame) -> None:
+        """右侧面板: 仅显示模型参数 (占满全部高度)。"""
+        box3 = ttk.LabelFrame(master, text="模型参数 (常用 / 扩展切换)", padding=6)
+        box3.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
         self.model_param_panel = ParamPanel(
             box3, scope="model",
             get=lambda k: self._get_model_param(k),

@@ -1,0 +1,108 @@
+# 更新日志 (Changelog)
+
+本项目的所有重要变更都记录在此文件。
+
+格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
+版本号遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
+
+## [Unreleased]
+
+待下次发布时填写
+
+---
+
+## [0.0.5] - 2026-09-07
+
+### 变更
+- **模型 tab 布局重构**：左侧（模型列表 + 基础信息 + 折叠的推测解码）| 右侧（全部给模型参数）
+- 模型参数面板从 ~350px 提升到 **600+px**（占满右侧栏所有高度），能多显示 8-10 个参数
+- 基础信息改 2 列紧凑布局（6 行 → 3 行 + 启用）
+- 顶部保存条缩短（36px → 32px），更紧凑
+
+### 新增
+- **`pre_publish_check.py`**：发布前自动检查脚本
+  - 检查 VERSION 是否已递增
+  - 检查 README 是否有 TODO/过时示例
+  - 检查 CHANGELOG 是否有本次版本条目
+  - 检查工作区是否干净
+  - 加 `--auto-fix` 自动从 git log 生成 [Unreleased] 段
+- **`CHANGELOG.md`**：正式记录每次发布的变更
+- **release.yml 增强**：从 CHANGELOG.md 自动提取本次版本的更新内容作为 release notes
+  - 格式：版本标题 + 更新内容（from CHANGELOG） + Git commits + 下载说明 + 系统要求
+  - 不再用 GitHub 默认的"自动生成 release notes"（质量太差）
+
+### 修复
+- 修正 VERSION 文件不同步问题（之前发布没更新）
+
+### 项目流程
+- **新规则**：以后不会自动发布
+  - 修改 → commit + push（main 分支）
+  - 想发布时显式说"发布 v0.0.x"
+  - 我会先跑 `pre_publish_check.py` 确认一切就绪
+  - 然后打 tag 触发 GitHub Actions 自动打包 + 发布
+
+---
+
+## [0.0.4] - 2026-09-06
+
+### 新增
+- 模型配置新增 `base_url` 和 `api_key` 字段（可选，留空使用本机 llama.cpp）
+- 实时监控窗口：自动跟跳 / 暂停 / 立即刷新 模式
+- 实时监控窗口：鼠标悬停模型名显示参数 tooltip，点击打开 JSON 详情
+- 实时监控窗口：日誌按类型高亮（info/warn/error/load/slot/speed）
+- 首次运行向导：空配置时弹窗引导用户设置
+- GitHub Actions：推 tag 自动打包 + 发布 Release
+- CI：每次 push 自动检查语法 / CRLF / .gitignore / 必需文件
+
+### 变更
+- 模型 tab 布局：左侧（模型列表 + 基础信息 + 推测解码折叠面板） | 右侧（全部给模型参数）
+- 基础信息改 2 列布局（6 行 → 3 行 + 启用）
+- 推测解码默认折叠，需要时手动展开
+- 主标签顺序改为：服务 / 全局 / 模型 / 偏好 / 环境
+
+### 修复
+- 启动监控窗口时不再残留空白 cmd 窗口（用 VBS 静默启动）
+- Python 3.14 + py.exe launcher stdin 重定向问题（find_python.cmd 优先用真路径）
+- bat/cmd 文件统一改为 CRLF 行尾
+- .bat/.cmd 文件中的中文字符串在 cmd 下乱码（加 chcp 65001 + PYTHONIOENCODING=utf-8）
+
+---
+
+## [0.0.3] - 2026-09-05
+
+### 新增
+- 模型编辑表单新增 `base_url` 和 `api_key` 字段
+- 实时监控窗口（实时日志 + 模型状态 + HTTP 端点）
+- README + 中文 FAQ 文档
+
+### 修复
+- NSSM 日志文件句柄偶尔卡住，加"重读日志"和"重启服务"按钮
+- 监控窗口 tooltip 闪烁问题
+- 监控窗口在用户查看历史时跳到最新（加跟跳 / 暂停逻辑）
+
+---
+
+## [0.0.2] - 2026-09-02
+
+### 新增
+- 首次运行向导（空配置弹窗引导）
+- 实时监控窗口
+- config.example.json 模板（带详细注释）
+- 项目主页、README、CI 工作流
+- publish_to_github.bat 开发者工具
+
+### 修复
+- build_release.py 在 Windows runner 上 UTF-8 编码问题
+
+---
+
+## [0.0.1] - 2026-09-01
+
+### 新增
+- 第一个可用版本
+- 核心功能：图形界面配置 llama.cpp 路由模式
+- Windows 服务管理（用 NSSM 注册 llama-router 服务）
+- 可选 watchdog 服务（显存守护）
+- 环境检查（Python / tkinter / NSSM / llama.cpp）
+- 200+ 个 llama-server 参数的支持（常用 / 扩展分类）
+- 完整的 .bat / .cmd / .ps1 启动脚本
