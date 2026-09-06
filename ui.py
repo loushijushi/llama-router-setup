@@ -1605,20 +1605,22 @@ class App(tk.Tk):
         self._build_model_editor(right)
 
     def _build_model_editor(self, master: ttk.Frame) -> None:
+        self._editor_master = master  # 保存引用供 _toggle_draft_box 用
         # 顶部醒目保存条 (改动后容易注意到)
-        top_bar = tk.Frame(master, bg="#FFA500", height=44)
-        top_bar.pack(fill=tk.X, padx=4, pady=(4, 6), side=tk.TOP)
+        top_bar = tk.Frame(master, bg="#FFA500", height=36)
+        top_bar.pack(fill=tk.X, padx=4, pady=(4, 4), side=tk.TOP)
         top_bar.pack_propagate(False)
         tk.Label(top_bar, text="⚠  修改后必须点「保存」才能写入 config.json + router-preset.ini ！",
-                 bg="#FFA500", fg="black", font=("", 10, "bold")).pack(side=tk.LEFT, padx=10, pady=8)
+                 bg="#FFA500", fg="black", font=("", 10, "bold")).pack(side=tk.LEFT, padx=10, pady=4)
         tk.Button(top_bar, text="💾  保存模型配置",
                   bg="#FF6B35", fg="white", font=("", 10, "bold"),
                   activebackground="#FF8C5A", activeforeground="white",
-                  relief=tk.RAISED, bd=2, padx=16, pady=4,
-                  command=self._on_save_model).pack(side=tk.RIGHT, padx=10, pady=6)
+                  relief=tk.RAISED, bd=2, padx=16, pady=2,
+                  command=self._on_save_model).pack(side=tk.RIGHT, padx=10, pady=4)
 
-        box1 = ttk.LabelFrame(master, text="基础信息", padding=8)
-        box1.pack(fill=tk.X, padx=4, pady=(4, 6))
+        # ===== 基础信息 (2 列紧凑布局) =====
+        box1 = ttk.LabelFrame(master, text="基础信息", padding=6)
+        box1.pack(fill=tk.X, padx=4, pady=(0, 4))
         self.var_id = tk.StringVar()
         self.var_alias = tk.StringVar()
         self.var_model = tk.StringVar()
@@ -1626,29 +1628,46 @@ class App(tk.Tk):
         self.var_enabled = tk.BooleanVar(value=True)
         self.var_base_url = tk.StringVar()   # API 端点 (留空表示用本机 llama.cpp)
         self.var_api_key = tk.StringVar()    # API 密钥 (留空表示无)
-        # (label, var, browse_ft, kind)  kind: "text" / "password"
-        rows = [
-            ("模型 ID (必填)", self.var_id, None, "text"),
-            ("API 别名 alias", self.var_alias, None, "text"),
-            ("主模型文件 (.gguf)", self.var_model, "gguf", "text"),
-            ("多模态 mmproj (可选)", self.var_mmproj, "gguf", "text"),
-            ("API 端点 base_url (可选, 留空=本机)", self.var_base_url, None, "text"),
-            ("API 密钥 api_key  (可选, 留空=无)", self.var_api_key, None, "password"),
+        # 2 列布局: row 0 是 ID/alias, row 1 是 model/mmproj, row 2 是 base_url/api_key
+        # (row, col, label, var, browse_ft, kind)
+        info_rows = [
+            (0, 0, "ID*",          self.var_id,      None,  "text"),
+            (0, 2, "别名 alias",   self.var_alias,   None,  "text"),
+            (1, 0, "主模型 .gguf*", self.var_model,   "gguf", "text"),
+            (1, 2, "mmproj",       self.var_mmproj,  "gguf", "text"),
+            (2, 0, "base_url",     self.var_base_url, None,  "text"),
+            (2, 2, "api_key",      self.var_api_key,  None,  "password"),
         ]
-        for i, (label, var, browse_ft, kind) in enumerate(rows):
-            ttk.Label(box1, text=label + ":").grid(row=i, column=0, sticky=tk.W, pady=3, padx=(0, 6))
+        for row, col, label, var, browse_ft, kind in info_rows:
+            sub = ttk.Frame(box1)
+            sub.grid(row=row, column=col, sticky=tk.EW, padx=(0, 8), pady=2)
+            ttk.Label(sub, text=label + ":").pack(side=tk.LEFT)
             show = "*" if kind == "password" else ""
-            ttk.Entry(box1, textvariable=var, show=show).grid(row=i, column=1, sticky=tk.EW, pady=3)
+            entry = ttk.Entry(sub, textvariable=var, show=show)
+            entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 0))
             if browse_ft:
-                ttk.Button(box1, text="浏览...",
-                           command=lambda v=var: self._browse(v, browse_ft)).grid(row=i, column=2, padx=4)
+                ttk.Button(sub, text="…",
+                           command=lambda v=var: self._browse(v, browse_ft)).pack(side=tk.LEFT, padx=(2, 0))
+        # row 3: 启用 + 保存提示
         ttk.Checkbutton(box1, text="启用 (未启用则不加入 preset.ini)",
-                        variable=self.var_enabled).grid(row=len(rows), column=0, columnspan=3,
-                                                          sticky=tk.W, pady=4)
-        box1.columnconfigure(1, weight=1)
+                        variable=self.var_enabled).grid(row=3, column=0, columnspan=4, sticky=tk.W, pady=(2, 0))
+        # 2 列等宽扩展
+        box1.columnconfigure(0, weight=1)
+        box1.columnconfigure(1, weight=0)
+        box1.columnconfigure(2, weight=1)
+        box1.columnconfigure(3, weight=0)
 
-        box2 = ttk.LabelFrame(master, text="推测解码 (Draft Model)  ——  MTP / DFlash / DFlash2", padding=8)
-        box2.pack(fill=tk.X, padx=4, pady=(0, 6))
+        # ===== 推测解码 (默认折叠, 用按钮展开) =====
+        # 占 0 空间, 给参数面板更多位置
+        draft_toggle_bar = ttk.Frame(master)
+        draft_toggle_bar.pack(fill=tk.X, padx=4, pady=(0, 2))
+        self._draft_collapsed = tk.BooleanVar(value=True)
+        ttk.Checkbutton(draft_toggle_bar,
+                        text="▸  推测解码 (Draft Model)  —— MTP / DFlash (点此展开, 一般用不到)",
+                        variable=self._draft_collapsed,
+                        command=self._toggle_draft_box
+                        ).pack(side=tk.LEFT)
+        self.draft_box = ttk.LabelFrame(master, text="推测解码 (Draft Model)", padding=6)
         self.var_draft_model = tk.StringVar()
         self.var_draft_type = tk.StringVar()
         self.var_draft_n_max = tk.StringVar(value="3")
@@ -1656,42 +1675,42 @@ class App(tk.Tk):
         self.var_draft_p_split = tk.StringVar(value="0.1")
         self.var_draft_p_min = tk.StringVar(value="0.0")
         self.var_draft_ngl = tk.StringVar(value="auto")
-
         # 第 0 行: 草稿模型路径
-        ttk.Label(box2, text="草稿模型 .gguf:").grid(row=0, column=0, sticky=tk.W, pady=3, padx=(0, 6))
-        ttk.Entry(box2, textvariable=self.var_draft_model).grid(row=0, column=1, columnspan=2, sticky=tk.EW, pady=3)
-        ttk.Button(box2, text="浏览...",
+        ttk.Label(self.draft_box, text="草稿模型 .gguf:").grid(row=0, column=0, sticky=tk.W, pady=3, padx=(0, 6))
+        ttk.Entry(self.draft_box, textvariable=self.var_draft_model).grid(row=0, column=1, columnspan=2, sticky=tk.EW, pady=3)
+        ttk.Button(self.draft_box, text="浏览...",
                    command=lambda: self._browse(self.var_draft_model, "gguf")).grid(row=0, column=3, padx=4)
-        # 第 1 行: 推测类型 + 草稿 GPU 层数
-        ttk.Label(box2, text="推测类型:").grid(row=1, column=0, sticky=tk.W, pady=3, padx=(0, 6))
-        ttk.Combobox(box2, textvariable=self.var_draft_type, width=14,
+        # 第 1 行: 推测类型 + 提示
+        ttk.Label(self.draft_box, text="推测类型:").grid(row=1, column=0, sticky=tk.W, pady=3, padx=(0, 6))
+        ttk.Combobox(self.draft_box, textvariable=self.var_draft_type, width=14,
                      values=self._choices["spec-type"]).grid(row=1, column=1, sticky=tk.W, pady=3)
-        ttk.Label(box2, text="(留空按文件名自动猜: mtp-/dflash-/dflash2-/dspark- 前缀)",
+        ttk.Label(self.draft_box, text="(留空按文件名自动猜)",
                   foreground="#888").grid(row=1, column=2, columnspan=2, padx=4, sticky=tk.W)
-        # 第 2 行: 推测数量 (n-max / n-min)
-        ttk.Label(box2, text="推测数量 (n-max):").grid(row=2, column=0, sticky=tk.W, pady=3, padx=(0, 6))
-        ttk.Spinbox(box2, textvariable=self.var_draft_n_max, width=8, from_=1, to=16).grid(
+        # 第 2 行: n-max / n-min
+        ttk.Label(self.draft_box, text="n-max:").grid(row=2, column=0, sticky=tk.W, pady=3, padx=(0, 6))
+        ttk.Spinbox(self.draft_box, textvariable=self.var_draft_n_max, width=8, from_=1, to=16).grid(
             row=2, column=1, sticky=tk.W, pady=3)
-        ttk.Label(box2, text="推测下限 (n-min):").grid(row=2, column=2, sticky=tk.W, pady=3, padx=(8, 6))
-        ttk.Spinbox(box2, textvariable=self.var_draft_n_min, width=8, from_=0, to=16).grid(
+        ttk.Label(self.draft_box, text="n-min:").grid(row=2, column=2, sticky=tk.W, pady=3, padx=(8, 6))
+        ttk.Spinbox(self.draft_box, textvariable=self.var_draft_n_min, width=8, from_=0, to=16).grid(
             row=2, column=3, sticky=tk.W, pady=3)
-        # 第 3 行: 拆词概率 (p-split / p-min) + 草稿 GPU 层数
-        ttk.Label(box2, text="拆词概率 (p-split):").grid(row=3, column=0, sticky=tk.W, pady=3, padx=(0, 6))
-        ttk.Spinbox(box2, textvariable=self.var_draft_p_split, width=8, from_=0.0, to=1.0, increment=0.05).grid(
+        # 第 3 行: p-split / p-min
+        ttk.Label(self.draft_box, text="p-split:").grid(row=3, column=0, sticky=tk.W, pady=3, padx=(0, 6))
+        ttk.Spinbox(self.draft_box, textvariable=self.var_draft_p_split, width=8, from_=0.0, to=1.0, increment=0.05).grid(
             row=3, column=1, sticky=tk.W, pady=3)
-        ttk.Label(box2, text="接受概率 (p-min):").grid(row=3, column=2, sticky=tk.W, pady=3, padx=(8, 6))
-        ttk.Spinbox(box2, textvariable=self.var_draft_p_min, width=8, from_=0.0, to=1.0, increment=0.05).grid(
+        ttk.Label(self.draft_box, text="p-min:").grid(row=3, column=2, sticky=tk.W, pady=3, padx=(8, 6))
+        ttk.Spinbox(self.draft_box, textvariable=self.var_draft_p_min, width=8, from_=0.0, to=1.0, increment=0.05).grid(
             row=3, column=3, sticky=tk.W, pady=3)
-        # 第 4 行: 草稿模型 GPU 层数
-        ttk.Label(box2, text="草稿 GPU 层数:").grid(row=4, column=0, sticky=tk.W, pady=3, padx=(0, 6))
-        ttk.Combobox(box2, textvariable=self.var_draft_ngl, width=14,
+        # 第 4 行: ngl
+        ttk.Label(self.draft_box, text="草稿 GPU 层数:").grid(row=4, column=0, sticky=tk.W, pady=3, padx=(0, 6))
+        ttk.Combobox(self.draft_box, textvariable=self.var_draft_ngl, width=14,
                      values=self._choices["spec-draft-ngl"]).grid(row=4, column=1, sticky=tk.W, pady=3)
-        ttk.Label(box2, text="(auto 自动, 0 纯 CPU, 99 全 GPU)",
+        ttk.Label(self.draft_box, text="(auto 自动, 0 纯 CPU, 99 全 GPU)",
                   foreground="#888").grid(row=4, column=2, columnspan=2, padx=4, sticky=tk.W)
-        box2.columnconfigure(1, weight=1)
+        self.draft_box.columnconfigure(1, weight=1)
 
-        box3 = ttk.LabelFrame(master, text="模型参数", padding=8)
-        box3.pack(fill=tk.BOTH, expand=True, padx=4, pady=(0, 6))
+        # ===== 模型参数 (占剩余所有空间) =====
+        box3 = ttk.LabelFrame(master, text="模型参数", padding=6)
+        box3.pack(fill=tk.BOTH, expand=True, padx=4, pady=(0, 4))
         self.model_param_panel = ParamPanel(
             box3, scope="model",
             get=lambda k: self._get_model_param(k),
@@ -1701,10 +1720,19 @@ class App(tk.Tk):
         self._param_panels.append(self.model_param_panel)
         self.model_param_panel.pack(fill=tk.BOTH, expand=True)
 
-        save_bar = ttk.Frame(master)
-        save_bar.pack(fill=tk.X, padx=4, pady=4)
-        ttk.Button(save_bar, text="保存模型配置",
-                   command=self._on_save_model).pack(side=tk.RIGHT)
+    def _toggle_draft_box(self) -> None:
+        """展开/折叠推测解码面板。"""
+        if self._draft_collapsed.get():
+            # 折叠 -> 移除
+            self.draft_box.pack_forget()
+        else:
+            # 展开 -> 插在 toggle bar 和 box3 (模型参数) 之间
+            for w in self._editor_master.winfo_children():
+                if isinstance(w, ttk.LabelFrame) and w.cget("text") == "模型参数":
+                    self.draft_box.pack(fill=tk.X, padx=4, pady=(0, 4), before=w)
+                    return
+            # 找不到就 fallback
+            self.draft_box.pack(fill=tk.X, padx=4, pady=(0, 4))
 
     def _get_model_param(self, key: str) -> Dict[str, Any]:
         sel = self.model_list.curselection()
