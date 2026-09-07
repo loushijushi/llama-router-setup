@@ -1570,13 +1570,12 @@ class App(tk.Tk):
     def _build_models_tab(self) -> None:
         f = ttk.Frame(self.nb, padding=8)
         self.nb.add(f, text="模型")
-        # 顶部橙色提示条 (强调要点击下方「新增」按钮)
-        top_bar = tk.Frame(f, bg="#FFA500", height=36)
+        # 顶部提示条 (与全局界面风格统一, 无橙色)
+        top_bar = ttk.Frame(f)
         top_bar.pack(fill=tk.X, side=tk.TOP, pady=(0, 8))
-        top_bar.pack_propagate(False)
-        tk.Label(top_bar, text="  👉 在左侧点「新增」添加你的 .gguf 模型, 或点击「删除」移除已有模型",
-                 bg="#FFA500", fg="white", font=("Segoe UI", 10, "bold"),
-                 anchor=tk.W).pack(side=tk.LEFT, fill=tk.Y)
+        ttk.Label(top_bar,
+                  text="  👉 在左侧点「新增」添加你的 .gguf 模型, 或点击「删除」移除已有模型",
+                  foreground="#555").pack(side=tk.LEFT, fill=tk.Y, padx=4, pady=4)
 
         # 左右分栏: 左 = 模型列表 + 基础信息 (上下排列), 右 = 模型参数 (占满)
         paned = ttk.PanedWindow(f, orient=tk.HORIZONTAL)
