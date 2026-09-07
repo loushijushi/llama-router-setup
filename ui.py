@@ -1620,17 +1620,13 @@ class App(tk.Tk):
 
     def _build_model_editor(self, master: ttk.Frame) -> None:
         self._editor_master = master  # 保存引用供 _toggle_draft_box 用
-        # 顶部醒目保存条 (改动后容易注意到)
-        top_bar = tk.Frame(master, bg="#FFA500", height=32)
+        # 顶部保存条 — 与全局页面位置一致（右上角，标准 ttk 风格，无橙色）
+        top_bar = ttk.Frame(master)
         top_bar.pack(fill=tk.X, padx=4, pady=(0, 4), side=tk.TOP)
-        top_bar.pack_propagate(False)
-        tk.Label(top_bar, text="⚠  修改后必须点「保存」",
-                 bg="#FFA500", fg="black", font=("", 9, "bold")).pack(side=tk.LEFT, padx=10, pady=4)
-        tk.Button(top_bar, text="💾  保存",
-                  bg="#FF6B35", fg="white", font=("", 9, "bold"),
-                  activebackground="#FF8C5A", activeforeground="white",
-                  relief=tk.RAISED, bd=2, padx=12, pady=2,
-                  command=self._on_save_model).pack(side=tk.RIGHT, padx=10, pady=2)
+        ttk.Label(top_bar, text="⚠  修改后点右上角「保存」",
+                  foreground="#666").pack(side=tk.LEFT, padx=10, pady=4)
+        ttk.Button(top_bar, text="💾  保存",
+                   command=self._on_save_model).pack(side=tk.RIGHT, padx=10, pady=2)
 
         # ===== 基础信息 (2 列紧凑布局) =====
         box1 = ttk.LabelFrame(master, text="基础信息", padding=6)
@@ -1928,18 +1924,6 @@ class App(tk.Tk):
         f = ttk.Frame(self.nb, padding=0)
         self.nb.add(f, text="全局")
 
-        # 顶部醒目保存条 (改动后容易注意到)
-        top_bar = tk.Frame(f, bg="#FFA500", height=44)
-        top_bar.pack(fill=tk.X, side=tk.TOP)
-        top_bar.pack_propagate(False)
-        tk.Label(top_bar, text="⚠  修改参数后必须点「保存」才能写入 config.json + router-preset.ini ！",
-                 bg="#FFA500", fg="black", font=("", 10, "bold")).pack(side=tk.LEFT, padx=10, pady=8)
-        tk.Button(top_bar, text="💾  保存全局配置",
-                  bg="#FF6B35", fg="white", font=("", 10, "bold"),
-                  activebackground="#FF8C5A", activeforeground="white",
-                  relief=tk.RAISED, bd=2, padx=16, pady=4,
-                  command=self._on_save_global).pack(side=tk.RIGHT, padx=10, pady=6)
-
         # 滚动区域 (服务参数 + watchdog + 全局参数)
         outer = ttk.Frame(f)
         outer.pack(fill=tk.BOTH, expand=True)
@@ -2032,12 +2016,6 @@ class App(tk.Tk):
             ttk.Button(box_files, text="📂 打开", width=8,
                        command=lambda p=path: self._open_file(p)).grid(row=i, column=2, padx=4, pady=2)
         box_files.columnconfigure(1, weight=1)
-
-        # 底栏提示文字 (无保存按钮 — 保存在顶部右上角)
-        bottom = ttk.Frame(f, padding=(10, 6, 10, 6), relief=tk.RAISED, borderwidth=1)
-        bottom.pack(fill=tk.X, side=tk.BOTTOM)
-        ttk.Label(bottom, text="提示: 改完点右上角「💾 保存」会写 config.json + router-preset.ini 并触发后台保存。",
-                  foreground="#666").pack(side=tk.LEFT, padx=4)
 
     def _browse_dir(self, var: tk.StringVar) -> None:
         d = filedialog.askdirectory()
