@@ -1391,7 +1391,7 @@ class App(tk.Tk):
             "  • Python / tkinter: 用 winget 自动安装 (需本机有 winget，Win10 1809+/Win11 自带)\n"
             "  • NSSM: 项目已内置 tools/nssm.exe，无需额外安装\n"
             "  • llama.cpp 二进制: 从 github.com/ggml-org/llama.cpp/releases 下载最新 release zip，"
-            "解压到任意目录 (如 C:\\llama.cpp)，然后到「全局」页改 llama_dir\n"
+            "解压到任意目录 (推荐纯英文路径，如 D:\\llama.cpp)，然后到「全局」页改 llama_dir\n"
             "  • 模型文件 (.gguf): 从 HuggingFace 等来源下载，路径在「模型」页设置"
         )
         ttk.Label(f, text=help_text, foreground="#666", justify=tk.LEFT,

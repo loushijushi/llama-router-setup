@@ -148,7 +148,7 @@ def build_zip(project_root: Path, version: str, output: Path,
             f"  2. 在「环境」标签页引导补齐缺失的依赖\n"
             f"  3. 在「全局」页设置你的 llama.cpp 目录\n\n"
             f"详细使用说明: 参考 README.md 或启动后点「❓ 帮助」按钮\n\n"
-            f"项目主页: https://github.com/loushijushi/llama-router-setup\n"
+            f"项目主页: https://github.com/YOUR_GITHUB_USER/llama-router-setup\n"
         )
         zf.writestr(f"{top_name}/INSTALL.txt", readme)
 

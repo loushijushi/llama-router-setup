@@ -31,8 +31,8 @@ test-router.bat        测试所有启用模型的切换
      - 安装时勾选 "Add python.exe to PATH"
      - 备注：tkinter 是 Python 自带的，无需额外安装
 
-1. 把本文件夹放在任意位置（建议放到 C:\llama.cpp\router\ 下，
-   方便和 llama-server.exe 一起管理）
+1. 把本文件夹放在任意位置（建议放到纯英文路径下，
+   避免和系统路径有冲突）
 
 2. 双击 manager-ui.bat 打开可视化界面
      - 如果弹「需要管理员」就右键 → 以管理员身份运行

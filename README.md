@@ -1,7 +1,7 @@
 # llama.cpp Router 管理工具
 
-[![Release](https://img.shields.io/github/v/release/loushijushi/llama-router-setup)](https://github.com/loushijushi/llama-router-setup/releases)
-[![License](https://img.shields.io/github/license/loushijushi/llama-router-setup)](LICENSE)
+[![Release](https://img.shields.io/github/v/release/YOUR_GITHUB_USER/llama-router-setup)](https://github.com/YOUR_GITHUB_USER/llama-router-setup/releases)
+[![License](https://img.shields.io/github/license/YOUR_GITHUB_USER/llama-router-setup)](LICENSE)
 
 一个可视化的 [llama.cpp](https://github.com/ggml-org/llama.cpp) `llama-server --models-preset` 路由模式管理工具。
 
@@ -14,7 +14,7 @@
 
 ## 📥 下载安装
 
-去 [**Releases 页面**](https://github.com/loushijushi/llama-router-setup/releases) 下载最新版本的 zip 包（当前 `v0.0.5`，约 200 KB）：
+去 [**Releases 页面**](https://github.com/YOUR_GITHUB_USER/llama-router-setup/releases) 下载最新版本的 zip 包（当前 `v0.0.5`，约 200 KB）：
 
 ```
 llama-router-setup-v0.0.5.zip
@@ -23,6 +23,11 @@ llama-router-setup-v0.0.5.zip
 解压到任意目录（**不要**有中文路径），双击 `manager-ui.bat` 即可。
 
 > 没有 git / Python 经验？直接下 zip 是最简单的安装方式。
+
+> **📝 填写指引（首次使用必读）**：
+> 1. 启动 UI → 「全局」标签页 → 「llama.cpp 安装目录」→ 选你的 llama.cpp 根目录（含 `llama-server.exe`）
+> 2. 「模型」标签页 → 左侧点「新增」→ 填 `id` + 选 `.gguf` 模型文件
+> 3. 「服务」标签页 → 点「安装」注册服务 → 点「启动」
 
 ## ✨ 功能特性
 
@@ -50,13 +55,13 @@ llama-router-setup-v0.0.5.zip
 ### 安装
 
 1. **下载 zip 包**（推荐大多数用户）
-   - 去 [Releases](https://github.com/loushijushi/llama-router-setup/releases) 下载最新版本
+   - 去 [Releases](https://github.com/YOUR_GITHUB_USER/llama-router-setup/releases) 下载最新版本
    - 解压到任意目录（**路径不要有中文**）
    - 双击 `manager-ui.bat` 启动
 
    或用 git:
    ```bash
-   git clone https://github.com/loushijushi/llama-router-setup.git
+   git clone https://github.com/YOUR_GITHUB_USER/llama-router-setup.git
    cd llama-router-setup
    ```
 
@@ -96,11 +101,11 @@ llama-router-setup-v0.0.5.zip
 启动后默认在**「环境」**页检查依赖是否齐全：
 
 ```
-✓ Python 3.8+   : Python 3.12.x
+✓ Python 3.8+   : 已找到
 ✓ tkinter        : 可用
 ✓ NSSM           : 内置 tools/nssm.exe
-✗ llama.cpp     : C:\llama.cpp\llama-server.exe 未找到  [修复]
-✗ 模型文件      : 路径无效                          [修复]
+✗ llama.cpp     : 未配置（请到「全局」页设置）
+✗ 模型文件      : 未配置（请到「模型」页添加）
 ```
 
 **「服务」**页可一键安装/启停服务：
@@ -109,31 +114,30 @@ llama-router-setup-v0.0.5.zip
 [ 安装 ] [ 卸载 ] [ 启动 ] [ 停止 ] [ 重启 ] [ 前台运行 ] [ 刷新状态 ] [ 📊 实时监控 ]
 ```
 
-**「模型」**页分左右栏（顶部橙色提示条提示点「新增」）：
+**「模型」**页（顶部提示条提示点「新增」）：
 
 ```
 👉 在左侧点「新增」添加你的 .gguf 模型
 ┌──────────┬─────────────────────────────────────┐
 │ 模型列表  │ 选中模型的所有参数（常用 / 扩展切换）│
-│ my-model  │  threads [✓] 8                        │
-│          │  ctx-size [✓] 262144                  │
-│ + 新增    │  batch-size [✓] 512                  │
-│ - 删除    │  cache-type-k [✓] q8_0               │
+│ my-model  │  [✓] threads    8                     │
+│          │  [✓] ctx-size   262144                 │
+│ + 新增    │  [✓] batch-size 512                   │
+│ - 删除    │  [✓] flash-attn on                    │
 └──────────┴─────────────────────────────────────┘
 ```
 
 **「📊 实时监控」**窗口拉满整个窗口，模型状态只在顶部一行：
 
 ```
-健康: ok │ 模型: ● ornith-35b  ◐ qwen3.6-35b       ← 悬停查看详情，点击打开 JSON
+健康: ok │ 模型: ● model-1  ○ model-2
 [ 🔁 重启服务 ] [ 🔧 重读日志 ] [ 🔄 立即刷新 ] [ 清空日志 ]
 ┌────────────────────────────────────────────────────────────┐
 │ 📜 实时日志 (router.out.log + router.err.log)              │
 │ 📍 跟跳: ON  ← 滚轮向上自动暂停，点「立即刷新」恢复  │
 │                                                            │
-│ [72992] 5.43.275 I slot print_timing: tg=45.23 t/s ...   │
-│ [72992] 5.46.276 I slot print_timing: tg=45.01 t/s ...   │
-│ [72992] 5.49.291 I slot print_timing: tg=44.85 t/s ...   │
+│ [PID] 0.43.275 I slot print_timing: tg=45.23 t/s ...    │
+│ [PID] 0.46.276 I slot print_timing: tg=45.01 t/s ...    │
 │ ...                                                        │
 └────────────────────────────────────────────────────────────┘
 ```
@@ -178,7 +182,7 @@ llama-router-setup/
 │   ├── nssm.exe               # 内置 NSSM (~360KB, 无需另装)
 │   └── README.txt             # NSSM 来源说明
 │
-├── VERSION                    # 当前版本号 (0.0.2)
+├── VERSION                    # 当前版本号
 ├── LICENSE                    # MIT 许可证
 ├── README.md                  # 本文件
 ├── 安装指南.txt                # 中文 FAQ
@@ -187,6 +191,10 @@ llama-router-setup/
 ├── dist/                      # 打包产物 (本地, .gitignore)
 └── __pycache__/               # Python 缓存 (.gitignore)
 ```
+
+> **📝 第一次使用提示**：
+> - 项目目录建议放到纯英文路径（如 `D:\llama-router-setup\`）
+> - 完整填写说明在 `安装指南.txt` 里
 
 ## 🛠️ 技术栈
 
@@ -214,7 +222,7 @@ A: 等几秒让首次 HTTP 轮询完成（`/v1/models`），之后悬停会显�
 A: 现在的版本用 VBS 静默启动，**不会**弹 cmd 窗口。如果还弹，请确认你用的是最新版。
 
 **Q: 路径里有中文/空格会出问题吗？**
-A: 项目目录路径有中文一般没事，但**强烈建议安装到纯英文路径**（如 `D:\llama-router-setup\`），避免 NSSM 解析异常。
+A: 项目目录路径有中文一般没事，但**强烈建议安装到纯英文路径**，避免 NSSM 解析异常。
 
 更多问题见 `安装指南.txt` 或在 UI 里点「❓ 帮助」。
 
@@ -224,14 +232,14 @@ A: 项目目录路径有中文一般没事，但**强烈建议安装到纯英文
 
 ### 克隆开发版
 ```bash
-git clone https://github.com/loushijushi/llama-router-setup.git
+git clone https://github.com/YOUR_GITHUB_USER/llama-router-setup.git
 cd llama-router-setup
 ```
 
 ### 本地打 zip 包
 ```bash
 py build_release.py                 # 使用 VERSION 文件里的版本
-py build_release.py --version 0.0.3 # 指定版本
+py build_release.py --version 0.0.5 # 指定版本
 py build_release.py --no-config     # 不带 config.example.json
 ```
 输出在 `dist/` 目录。
@@ -250,7 +258,7 @@ py build_release.py --no-config     # 不带 config.example.json
    ```
 3. 推 tag 触发自动发布：
    ```bash
-    git tag v0.0.5
+   git tag v0.0.5
    git push --tags
    ```
 4. GitHub Actions 自动：
@@ -258,7 +266,7 @@ py build_release.py --no-config     # 不带 config.example.json
    - 验证 zip 生成
    - 创建 GitHub Release（自动生成 changelog）
    - 上传 zip 作为 binary
-5. 几分钟后在 https://github.com/loushijushi/llama-router-setup/releases 看到
+5. 几分钟后在 https://github.com/YOUR_GITHUB_USER/llama-router-setup/releases 看到
 
 ### 首次发布到 GitHub
 如果是第一次从本地推到 GitHub，运行 `publish_to_github.bat`，按提示操作。
