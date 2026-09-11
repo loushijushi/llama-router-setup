@@ -121,11 +121,11 @@ jobs:
           $notes += "- llama.cpp (含 llama-server.exe)`n"
           $notes += "- .gguf 模型文件`n"
 
-          # 写到 GITHUB_OUTPUT 供下一步用
-          $notes | Out-File -FilePath "$env:GITHUB_OUTPUT" -Encoding UTF8 -Append
-          Add-Content -Path "$env:GITHUB_OUTPUT" -Value "release_notes<<EOF"
-          Add-Content -Path "$env:GITHUB_OUTPUT" -Value $notes
-          Add-Content -Path "$env:GITHUB_OUTPUT" -Value "EOF"
+          # 写到 GITHUB_OUTPUT 供下一步用 (使用 PowerShell 兼容的 heredoc)
+          $notesFile = $env:GITHUB_OUTPUT
+          "release_notes<<EOF" | Out-File -FilePath $notesFile -Encoding UTF8 -Append
+          $notes | Out-File -FilePath $notesFile -Encoding UTF8 -Append
+          "EOF" | Out-File -FilePath $notesFile -Encoding UTF8 -Append
           Write-Host ""
           Write-Host "=== Release notes (前 30 行) ==="
           ($notes -split "`n")[0..29] | ForEach-Object { Write-Host "  $_" }
