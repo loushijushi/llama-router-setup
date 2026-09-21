@@ -14,10 +14,10 @@
 
 ## 📥 下载安装
 
-去 [**Releases 页面**](https://github.com/YOUR_GITHUB_USER/llama-router-setup/releases) 下载最新版本的 zip 包（当前 `v0.0.5`，约 200 KB）：
+去 [**Releases 页面**](https://github.com/YOUR_GITHUB_USER/llama-router-setup/releases) 下载最新版本的 zip 包（当前 `v0.1.0`，约 200 KB）：
 
 ```
-llama-router-setup-v0.0.5.zip
+llama-router-setup-v0.1.0.zip
 ```
 
 解压到任意目录（**不要**有中文路径），双击 `manager-ui.bat` 即可。
@@ -239,14 +239,14 @@ cd llama-router-setup
 ### 本地打 zip 包
 ```bash
 py build_release.py                 # 使用 VERSION 文件里的版本
-py build_release.py --version 0.0.5 # 指定版本
+py build_release.py --version 0.1.0 # 指定版本
 py build_release.py --no-config     # 不带 config.example.json
 ```
 输出在 `dist/` 目录。
 
 ### 发布新版本到 GitHub Releases
 
-**当前约定**：版本号从 `0.0.1` 开始，按 `0.0.1 → 0.0.2 → 0.0.3 → ...` 递增。
+**当前约定**：版本号遵循语义化版本 (SemVer)。已发布 `v0.1.0`，后续按 `v0.1.x` 或 `v1.0.0` 递增。
 
 发布流程：
 1. 修改 `VERSION` 文件
@@ -258,8 +258,8 @@ py build_release.py --no-config     # 不带 config.example.json
    ```
 3. 推 tag 触发自动发布：
    ```bash
-   git tag v0.0.5
-   git push --tags
+    git tag v0.1.0
+    git push --tags
    ```
 4. GitHub Actions 自动：
    - 在 Windows runner 上运行 `build_release.py`

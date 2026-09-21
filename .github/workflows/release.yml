@@ -11,7 +11,7 @@ on:
       version:
         description: '版本号 (如 1.0.0, 不带 v 前缀)'
         required: true
-        default: '0.0.1'
+        default: '0.1.0'
 
 permissions:
   contents: write   # 创建 release 需要写权限

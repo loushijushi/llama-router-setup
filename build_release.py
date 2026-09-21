@@ -1,7 +1,7 @@
 """生成可分发的 zip 包 (用于 GitHub Releases)。
 
 用法:
-    py build_release.py                 # 默认打包当前目录到 dist/llama-router-setup-v0.0.1.zip
+    py build_release.py                 # 默认打包当前目录到 dist/llama-router-setup-v{ver}.zip
     py build_release.py --version 1.2.3 --output /tmp/release.zip
     py build_release.py --no-config     # 不带 config.example.json (更精简)
 
@@ -90,7 +90,7 @@ def collect_files(project_root: Path) -> list:
 
 
 def get_version(version_arg: str | None) -> str:
-    """确定版本号: 命令行参数 > 从 VERSION 文件读 > 从 git tag 读 > 默认 0.0.1。"""
+    """确定版本号: 命令行参数 > 从 VERSION 文件读 > 从 git tag 读 > 默认 0.1.0。"""
     if version_arg:
         return version_arg
     # 从 VERSION 文件
@@ -111,7 +111,7 @@ def get_version(version_arg: str | None) -> str:
             return tag.lstrip("v")
     except Exception:
         pass
-    return "0.0.1"
+    return "0.1.0"
 
 
 def build_zip(project_root: Path, version: str, output: Path,
