@@ -431,8 +431,8 @@ class PrefsTab(ttk.Frame):
 
         mid = ttk.Frame(body)
         mid.pack(side=tk.LEFT, fill=tk.Y, padx=4)
-        ttk.Button(mid, text="<< 加入", command=self._add_to_common).pack(pady=2)
-        ttk.Button(mid, text="移出 >>", command=self._remove_from_common).pack(pady=2)
+        ttk.Button(mid, text=">> 加入", command=self._add_to_common).pack(pady=2)
+        ttk.Button(mid, text="移出 <<", command=self._remove_from_common).pack(pady=2)
         ttk.Button(mid, text="上移", command=lambda: self._move_common(-1)).pack(pady=2)
         ttk.Button(mid, text="下移", command=lambda: self._move_common(1)).pack(pady=2)
 
