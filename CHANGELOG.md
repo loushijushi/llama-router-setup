@@ -7,7 +7,12 @@
 
 ## [Unreleased]
 
-- 修复「偏好」标签页中「加入」和「移出」按钮箭头方向反转
+### 修复
+- 启动闪退：`manager-ui.bat` 崩溃时红色报错一闪而过看不清
+  - 新增 `launch_ui_logged.cmd`：stderr 写入 `logs\ui_launch.log`，失败时显示完整错误并暂停
+  - `ui.py` 崩溃兜底：traceback 保存到 `logs\ui_crash.log`
+  - 找不到 Python 且安装指引窗口也打不开时，暂停显示提示
+  - 偏好栏箭头方向反转已修复（`>> 加入` / `移出 <<`）
 
 ---
 

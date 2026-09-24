@@ -2124,8 +2124,26 @@ class App(tk.Tk):
 
 
 def main() -> None:
-    app = App()
-    app.mainloop()
+    try:
+        app = App()
+        app.mainloop()
+    except Exception:
+        import traceback
+        log_dir = os.path.join(config.app_dir(), "logs")
+        try:
+            os.makedirs(log_dir, exist_ok=True)
+            log_path = os.path.join(log_dir, "ui_crash.log")
+            with open(log_path, "w", encoding="utf-8") as f:
+                traceback.print_exc(file=f)
+        except Exception:
+            log_path = "(写入 logs\\ui_crash.log 失败)"
+        traceback.print_exc()
+        print(f"\n[ERROR] UI crashed. Traceback saved to: {log_path}", flush=True)
+        try:
+            input("Press Enter to exit...")
+        except Exception:
+            pass
+        raise
 
 
 if __name__ == "__main__":

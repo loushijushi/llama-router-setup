@@ -29,8 +29,8 @@ if errorlevel 1 (
 
 REM ---- Start UI ----
 echo Starting UI...
-REM 用 VBScript 静默启动 Python UI (不弹出 cmd 窗口)
-cscript //NoLogo "%~dp0launch_ui_hidden.vbs" "%_PY_EXE%"
+REM 最小窗口启动; stderr 写入 logs\ui_launch.log; 崩溃时显示错误并暂停 (不闪退)
+start "llama-router-ui" /min "%ComSpec%" /c call "%~dp0launch_ui_logged.cmd" "%_PY_EXE%"
 exit /b 0
 
 :no_python
@@ -39,4 +39,11 @@ echo   [ERROR] Python not found!
 echo ============================================
 echo.
 powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0show_python_missing.ps1"
+if errorlevel 1 (
+    echo.
+    echo [ERROR] Python 安装指引窗口打开失败，请手动安装 Python 3.8+:
+    echo         https://www.python.org/downloads/
+    echo         安装时勾选 "Add python.exe to PATH"
+    pause
+)
 exit /b 1

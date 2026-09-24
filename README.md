@@ -164,7 +164,8 @@ llama-router-setup/
 ├── test-router.bat            # 测试路由连通性
 │
 ├── find_python.cmd            # 找 Python (优先用真路径, 避开 MS Store 占位)
-├── launch_ui_hidden.vbs       # 静默启动 Python UI (不弹 cmd 窗口)
+├── launch_ui_logged.cmd       # 启动 UI 并记录日志 (崩溃时不闪退, 显示错误)
+├── launch_ui_hidden.vbs       # (可选) 完全静默启动, 不留任何窗口
 ├── show_python_missing.ps1    # 找不到 Python 时弹窗引导安装
 ├── publish_to_github.bat      # (开发者) 一键发布到 GitHub
 ├── build_release.bat          # (开发者) 打包 zip 用于测试
@@ -218,8 +219,11 @@ A: 在「模型」页勾上 `reasoning` 参数，值 `off`。⚠️ 注意：**Q
 **Q: 实时监控悬停模型名没反应？**
 A: 等几秒让首次 HTTP 轮询完成（`/v1/models`），之后悬停会显示 tooltip。
 
-**Q: 双击 `manager-ui.bat` 弹出一个 cmd 窗口？**
-A: 现在的版本用 VBS 静默启动，**不会**弹 cmd 窗口。如果还弹，请确认你用的是最新版。
+**Q: 双击 `manager-ui.bat` 后窗口一闪就退出 / 报错看不清？**
+A: 现在会最小化一个窗口启动 UI，错误写入 `logs\ui_launch.log`；如果 UI 崩溃，窗口会**停住并显示完整报错**（按任意键关闭）。若仍闪退，请把 `logs\ui_launch.log` 和 `logs\ui_crash.log` 发给维护者。
+
+**Q: 想要完全无窗口启动？**
+A: 可用 `launch_ui_hidden.vbs` 代替（崩溃时错误只在日志里，看不到窗口）。
 
 **Q: 路径里有中文/空格会出问题吗？**
 A: 项目目录路径有中文一般没事，但**强烈建议安装到纯英文路径**，避免 NSSM 解析异常。
