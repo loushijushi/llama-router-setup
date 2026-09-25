@@ -13,6 +13,12 @@
   - `ui.py` 崩溃兜底：traceback 保存到 `logs\ui_crash.log`
   - 找不到 Python 且安装指引窗口也打不开时，暂停显示提示
   - 偏好栏箭头方向反转已修复（`>> 加入` / `移出 <<`）
+- `'e' is not recognized` 随机报错（新机器必现）
+  - `find_python.cmd` 改为纯 ASCII（中文 REM + `chcp 65001` 会让 cmd 解析错乱）
+  - 去掉 `echo | findstr` 管道，改用延迟扩展字符串替换过滤 MS Store 占位
+- `show_python_missing.ps1` 在中文 Windows 上打不开
+  - 加 UTF-8 BOM（PowerShell 5.1 无 BOM 按 GBK 读，中文破坏语法）
+  - 修复 winget 按钮命令的嵌套引号错误，改用 `-EncodedCommand`
 
 ---
 

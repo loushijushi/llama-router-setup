@@ -1,13 +1,13 @@
 @echo off
 chcp 65001 >nul 2>&1
-setlocal EnableExtensions
+setlocal EnableExtensions EnableDelayedExpansion
 
 set "_PY_EXE="
 set "_TMP=%TEMP%\__find_py_%RANDOM%.txt"
 
 REM ==========================================
-REM 优先在已知安装目录里找实际 Python 解释器
-REM 避免拿到 MS Store 占位 python.exe 或 py.exe launcher (在 Python 3.14 上有 stdin 问题)
+REM search known install dirs first
+REM avoid MS Store stub python.exe and py.exe launcher (stdin issues on 3.14)
 REM ==========================================
 for %%P in (
     "%LOCALAPPDATA%\Programs\Python\Python314\python.exe"
@@ -40,15 +40,17 @@ for %%P in (
 )
 
 REM ==========================================
-REM 备用: PATH 里的 python.exe / py.exe
-REM 过滤掉 MS Store 占位 (在 "WindowsApps" 目录下)
+REM fallback: python.exe / py.exe from PATH
+REM filter MS Store stub (in WindowsApps dir) via string substitution, no pipe
 REM ==========================================
 where python.exe > "%_TMP%" 2>nul
 if not errorlevel 1 (
     for /f "usebackq tokens=* delims=" %%P in ("%_TMP%") do (
-        if not "%%P"=="" if not "%%P"=="INFO:" (
-            echo %%P | findstr /I /C:"WindowsApps" >nul
-            if errorlevel 1 (
+        if not "%%P"=="" (
+            set "_S=%%P"
+            if /I not "!_S:WindowsApps=!"=="!_S!" (
+                REM skip MS Store stub
+            ) else (
                 set "_PY_EXE=%%P"
                 goto :done
             )
@@ -59,9 +61,11 @@ if not errorlevel 1 (
 where py.exe > "%_TMP%" 2>nul
 if not errorlevel 1 (
     for /f "usebackq tokens=* delims=" %%P in ("%_TMP%") do (
-        if not "%%P"=="" if not "%%P"=="INFO:" (
-            echo %%P | findstr /I /C:"WindowsApps" >nul
-            if errorlevel 1 (
+        if not "%%P"=="" (
+            set "_S=%%P"
+            if /I not "!_S:WindowsApps=!"=="!_S!" (
+                REM skip MS Store stub
+            ) else (
                 set "_PY_EXE=%%P"
                 goto :done
             )

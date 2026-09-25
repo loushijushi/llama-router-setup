@@ -1,4 +1,4 @@
-# Show-Python-Missing.ps1
+﻿# Show-Python-Missing.ps1
 # 当 manager-ui.bat 探测不到 Python 时被调用
 # 弹出一个清晰的中文安装指引窗口
 
@@ -70,12 +70,11 @@ $btnWinget.Size = New-Object System.Drawing.Size(180, 36)
 $btnWinget.Text = "用 winget 安装 (管理员)"
 $btnWinget.Font = New-Object System.Drawing.Font("Microsoft YaHei", 10)
 $btnWinget.Add_Click({
-    $psi = New-Object System.Diagnostics.ProcessStartInfo
-    $psi.FileName = "powershell"
-    $psi.Arguments = "-NoProfile -Command `"Start-Process powershell -ArgumentList '-NoProfile -Command winget install Python.Python.3.12 -y; Write-Host \"\n安装完成！关闭本窗口后请重新双击 manager-ui.bat\" -ForegroundColor Green; pause`" -Verb RunAs`""
-    $psi.UseShellExecute = $true
     try {
-        [System.Diagnostics.Process]::Start($psi) | Out-Null
+        # 用 -EncodedCommand 规避多层引号嵌套问题
+        $inner = 'winget install Python.Python.3.12 -y; Write-Host "安装完成！关闭本窗口后请重新双击 manager-ui.bat" -ForegroundColor Green; pause'
+        $enc = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($inner))
+        Start-Process -FilePath "powershell" -ArgumentList "-NoProfile", "-EncodedCommand", $enc -Verb RunAs
     } catch {
         [System.Windows.Forms.MessageBox]::Show("无法启动安装: $_`n请手动以管理员身份运行:`nwinget install Python.Python.3.12", "提示", "OK", "Information")
     }
