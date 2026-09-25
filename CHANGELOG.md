@@ -9,7 +9,9 @@
 
 ### 修复
 - 启动闪退：`manager-ui.bat` 崩溃时红色报错一闪而过看不清
-  - 新增 `launch_ui_logged.cmd`：stderr 写入 `logs\ui_launch.log`，失败时显示完整错误并暂停
+  - 新增 `launch_ui.ps1` + `launch_ui_logged.cmd`：隐藏窗口启动 UI，stderr 写入 `logs\ui_launch.log`
+  - 启动失败时窗口停住显示完整错误并暂停；正常时几秒后自动关闭
+  - **不再残留黑色 cmd 窗口**（旧版最小化窗口会一直驻留到 UI 关闭）
   - `ui.py` 崩溃兜底：traceback 保存到 `logs\ui_crash.log`
   - 找不到 Python 且安装指引窗口也打不开时，暂停显示提示
   - 偏好栏箭头方向反转已修复（`>> 加入` / `移出 <<`）

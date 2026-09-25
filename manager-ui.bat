@@ -29,9 +29,9 @@ if errorlevel 1 (
 
 REM ---- Start UI ----
 echo Starting UI...
-REM 最小窗口启动; stderr 写入 logs\ui_launch.log; 崩溃时显示错误并暂停 (不闪退)
-start "llama-router-ui" /min "%ComSpec%" /c call "%~dp0launch_ui_logged.cmd" "%_PY_EXE%"
-exit /b 0
+REM 隐藏窗口启动 UI (后台观察 5 秒: 正常则自动关窗, 失败则显示日志并暂停)
+call "%~dp0launch_ui_logged.cmd" "%_PY_EXE%"
+exit /b %ERRORLEVEL%
 
 :no_python
 echo ============================================
