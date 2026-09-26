@@ -151,12 +151,14 @@ jobs:
           # 跑构建, 失败时显示错误
           try {
             python build_release.py --version $version
+            if ($LASTEXITCODE -ne 0) {
+              # build_release.py 隐私检查失败时会删掉 zip 并退出 1
+              throw "build_release.py 退出码 $LASTEXITCODE (通常是隐私检查没通过)"
+            }
             Write-Host ""
             Write-Host "=== Build OK ==="
           } catch {
             Write-Host "::error::构建失败: $_"
-            Write-Host "=== Retry with verbose output ==="
-            python build_release.py --version $version
             exit 1
           }
 
@@ -167,6 +169,27 @@ jobs:
             exit 1
           }
           Write-Host "Zip: $($zip.FullName) ($($zip.Length) bytes)"
+
+          # 隐私复核: 发布包里绝不能有本机配置
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $z = [System.IO.Compression.ZipFile]::OpenRead($zip.FullName)
+          $private = @("config.json", "user_preferences.json", "router-preset.ini")
+          $bad = $z.Entries | Where-Object {
+            $n = $_.FullName
+            $base = $n.Split('/')[-1]
+            ($private -contains $base) -or ($n -match '(^|/)logs/') -or ($n -match '(^|/)dist/')
+          }
+          $names = ($z.Entries | ForEach-Object { $_.FullName }) -join "`n"
+          $z.Dispose()
+          if ($bad) {
+            $bad | ForEach-Object { Write-Host "::error::发布包含私有文件: $($_.FullName)" }
+            exit 1
+          }
+          if ($names -notmatch 'config\.example\.json') {
+            Write-Host "::error::发布包缺少 config.example.json 空白模板"
+            exit 1
+          }
+          Write-Host "隐私复核通过: 不含 config.json / user_preferences.json / router-preset.ini / logs/"
 
       - name: 显示 zip 内容
         shell: pwsh

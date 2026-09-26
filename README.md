@@ -14,10 +14,10 @@
 
 ## 📥 下载安装
 
-去 [**Releases 页面**](https://github.com/YOUR_GITHUB_USER/llama-router-setup/releases) 下载最新版本的 zip 包（当前 `v0.1.0`，约 200 KB）：
+去 [**Releases 页面**](https://github.com/YOUR_GITHUB_USER/llama-router-setup/releases) 下载最新版本的 zip 包（当前 `v0.1.1`，约 200 KB）：
 
 ```
-llama-router-setup-v0.1.0.zip
+llama-router-setup-v0.1.1.zip
 ```
 
 解压到任意目录（**不要**有中文路径），双击 `manager-ui.bat` 即可。
@@ -34,8 +34,8 @@ llama-router-setup-v0.1.0.zip
 | 功能 | 说明 |
 |---|---|
 | **首次运行向导** | 空配置自动弹窗引导设置 llama_dir + 添加模型 |
-| **多模型管理** | 在 UI 里增删改查模型条目（路径、别名、草稿模型等） |
-| **常用/扩展参数** | 自动展开 200+ 个 llama-server 参数，每个有中文说明和默认值 |
+| **多模型管理** | 在 UI 里增删改查模型条目（路径、别名、推测解码开关等，草稿文件可选） |
+| **常用/扩展参数** | 自动展开 200+ 个 llama-server 参数，每个有中文说明和默认值；保存时按本机 `llama-server --help` 核对，不认识的 key 自动跳过并提示，不会让整个 preset 解析失败 |
 | **Windows 服务** | 用 NSSM 把 llama-server 注册成 `llama-router` 服务 |
 | **显存守护** | 可选 watchdog 服务，显存不足时自动 unload 模型 |
 | **实时监控** | 监控窗口拉满整个宽度，日志带颜色高亮、自动跟跳、悬停看模型详情 |
@@ -244,14 +244,14 @@ cd llama-router-setup
 ### 本地打 zip 包
 ```bash
 py build_release.py                 # 使用 VERSION 文件里的版本
-py build_release.py --version 0.1.0 # 指定版本
+py build_release.py --version 0.1.1 # 指定版本
 py build_release.py --no-config     # 不带 config.example.json
 ```
 输出在 `dist/` 目录。
 
 ### 发布新版本到 GitHub Releases
 
-**当前约定**：版本号遵循语义化版本 (SemVer)。已发布 `v0.1.0`，后续按 `v0.1.x` 或 `v1.0.0` 递增。
+**当前约定**：版本号遵循语义化版本 (SemVer)。已发布 `v0.1.1`，后续按 `v0.1.x` 或 `v1.0.0` 递增。
 
 发布流程：
 1. 修改 `VERSION` 文件
@@ -263,7 +263,7 @@ py build_release.py --no-config     # 不带 config.example.json
    ```
 3. 推 tag 触发自动发布：
    ```bash
-    git tag v0.1.0
+    git tag v0.1.1
     git push --tags
    ```
 4. GitHub Actions 自动：

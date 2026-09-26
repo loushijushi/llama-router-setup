@@ -7,15 +7,21 @@
   4. CHANGELOG.md 是否有本次发布的条目 (没有就提示填写)
   5. VERSION 文件版本号是否与上次发布 tag 一致 (一致说明没递增, 提示)
   6. 是否有未提交/未推送的修改 (防止发布时丢失)
+  7. README 中是否有过时内容
+  8. **隐私检查**: 本机配置 (config.json / user_preferences.json /
+     router-preset.ini) 是否会被公开 —— 跟踪状态、.gitignore、
+     build_release.py 排除项、以及跟踪文件里有没有本机模型路径/模型名/api_key
 
 用法:
   py pre_publish_check.py              # 默认检查
   py pre_publish_check.py --auto-fix   # 给出建议后自动生成 CHANGELOG 草稿
 """
 import argparse
+import json
 import re
 import subprocess
 import sys
+from datetime import date
 from pathlib import Path
 
 # 强制 UTF-8 输出
@@ -34,6 +40,43 @@ def run(cmd: list, cwd: str = None) -> tuple:
 def git(*args) -> tuple:
     """Run git command in the project root."""
     return run(["git", "-C", str(PROJECT_ROOT)] + list(args))
+
+
+def private_markers() -> list:
+    """从本机 config.json 提取有辨识度的标识 (模型路径 / 模型名 / api_key)。
+
+    只读, 不会修改或删除 config.json。
+    """
+    cfg = PROJECT_ROOT / "config.json"
+    if not cfg.exists():
+        return []
+    try:
+        data = json.loads(cfg.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    found = []
+    for m in data.get("models", []):
+        for k in ("model", "mmproj", "base_url", "api_key", "id", "alias"):
+            v = str(m.get(k) or "").strip()
+            if v:
+                found.append(v)
+    for m in list(found):
+        if "\\" in m or "/" in m:
+            found.append(m.replace("\\", "/"))
+    seen, out = set(), []
+    for s in found:
+        if len(s) < 4 or s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
+    return out
+
+
+def mask_secret(s: str) -> str:
+    """报错信息里不要原样打印 api_key。"""
+    if len(s) <= 8:
+        return s[:2] + "***"
+    return s[:4] + "***" + s[-4:]
 
 
 def main():
@@ -160,6 +203,71 @@ def main():
             outdated.append("build_release.py 默认版本 0.1.0")
         if outdated:
             warnings.append("README.md 可能有过时内容:\n  - " + "\n  - ".join(outdated))
+
+    # ----- 8. 隐私检查: 本机配置绝不能被公开 -----
+    print("[隐私检查] 本机配置是否会被发布出去 ...")
+    PRIVATE_FILES = ("config.json", "user_preferences.json", "router-preset.ini")
+
+    # 8.1 必须被 .gitignore 必须没被跟踪
+    for pf in PRIVATE_FILES:
+        rc_ig, _, _ = git("check-ignore", "-q", pf)
+        if rc_ig != 0:
+            issues.append(
+                f"{pf} 不在 .gitignore 里 -> 一旦 git add 就会被推到公开仓库\n"
+                f"   处理: 把 {pf} 加进 .gitignore")
+        rc_tr, _, _ = git("ls-files", "--error-unmatch", pf)
+        if rc_tr == 0:
+            issues.append(
+                f"{pf} 已被 git 跟踪 (会随仓库公开!)\n"
+                f"   处理: git rm --cached {pf} && git commit -m 'remove private {pf}'")
+        else:
+            passed.append(f"{pf} 未被 git 跟踪")
+
+    # 8.2 build_release.py 必须把它们排除
+    br = PROJECT_ROOT / "build_release.py"
+    if br.exists():
+        br_txt = br.read_text(encoding="utf-8")
+        for pf in ("config.json", "user_preferences.json", "router-preset.ini"):
+            if f'"{pf}"' not in br_txt and f"'{pf}'" not in br_txt:
+                issues.append(
+                    f"build_release.py 没有排除 {pf} -> 会被打进发布 zip")
+        if "verify_zip_privacy" in br_txt:
+            passed.append("build_release.py 打包后会复扫 zip (verify_zip_privacy)")
+        else:
+            warnings.append("build_release.py 缺少打包后的隐私复扫 (verify_zip_privacy)")
+    else:
+        warnings.append("build_release.py 不存在, 无法校验打包排除项")
+
+    # 8.3 跟踪文件里不能出现本机模型路径 / 模型名 / api_key
+    markers = private_markers()
+    if markers:
+        rc_ls, tracked, _ = git("-c", "core.quotepath=false", "ls-files")
+        leaked = []
+        if rc_ls == 0:
+            for rel in tracked.splitlines():
+                rel = rel.strip()
+                if not rel:
+                    continue
+                fp = PROJECT_ROOT / rel
+                if not fp.is_file() or fp.stat().st_size > 2 * 1024 * 1024:
+                    continue
+                try:
+                    text = fp.read_text(encoding="utf-8")
+                except Exception:
+                    try:
+                        text = fp.read_text(encoding="gbk")
+                    except Exception:
+                        continue
+                for mk in markers:
+                    if mk in text:
+                        leaked.append((rel, mk))
+        if leaked:
+            for rel, mk in leaked:
+                issues.append(f"跟踪文件 {rel} 泄漏本机信息: 含 '{mask_secret(mk)}'")
+        else:
+            passed.append(f"跟踪文件未发现本机配置痕迹 (比对 {len(markers)} 个标识)")
+    else:
+        print("  (本机没有 config.json, 跳过内容比对)")
 
     # ----- 输出结果 -----
     print()

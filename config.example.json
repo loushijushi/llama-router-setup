@@ -30,6 +30,7 @@
             "mmproj": "",
             "base_url": "",
             "api_key": "",
+            "draft_enabled": false,
             "draft_model": "",
             "draft_type": "",
             "draft_n_max": 3,

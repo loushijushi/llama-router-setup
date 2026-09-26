@@ -7,7 +7,77 @@
 
 ## [Unreleased]
 
+---
+
+## [0.1.1] - 2026-09-26
+
+### 新增
+- **发布隐私保障：本机配置绝不会被打进发布包**（你自己的 `config.json` 全程只读，不受影响）
+  - 发布包**只含 `config.example.json` 空白模板**，不含 `config.json` /
+    `user_preferences.json` / `router-preset.ini` / `logs/`（首次运行由程序自动生成空配置）
+  - 三层防护：
+    1. `.gitignore` + git 未跟踪（防推到公开仓库）
+    2. `build_release.py` 的 `EXCLUDE_FILES` 与新增的 `PRIVATE_FILES` 双重兜底
+    3. 打包后 `verify_zip_privacy()` **复扫 zip 里每个文本文件**，
+       对照本机 `config.json` 里的模型路径 / 模型名 / `api_key` 逐个比对
+  - 一旦违规：打印清单（敏感值打码，不原样输出 api_key）、**删除 zip**、退出码 1
+  - `pre_publish_check.py` 新增第 8 项隐私检查（跟踪状态 / `.gitignore` /
+    打包排除项 / 跟踪文件内容比对），违规直接判定「不建议发布」
+  - CI `release.yml` 补 `$LASTEXITCODE` 校验 + zip 内容复核
+    （原实现 PowerShell 不会因非零退出码让步骤失败，等于隐私闸门形同虚设）
+  - 新增 `test_release_privacy.py` 8 例，覆盖：git 跟踪状态、排除清单、
+    污染模板必须打包失败且删包、干净项目打包成功、真实包零泄漏、
+    **打包前后 `config.json` 指纹完全一致**
+- **偏好页左侧「所有参数」列表支持搜索 + 排序**（100+ 项里找参数不再靠肉眼扫）
+  - 搜索框：大小写不敏感，匹配 key / 标签 / 作用域 / 分类，**中文标签也能搜**（搜「物理批」命中 `ubatch-size`）
+    - 查询串开头的 `-` / `--` 会被忽略：搜 `-ub`、`--ubatch-size`、`ub` 结果一致
+    - 右上角实时显示「共 N 项, 匹配 M 项」，按回车跳到第一条匹配
+  - 排序：点列头 升序 → 降序 → 恢复默认（schema 原始顺序），列头显示 ▲ / ▼ 标识当前排序
+    - 可排序列：`key`、标签、作用域、分类；切到另一列自动从升序开始
+  - 搜索不影响右侧「已设为常用」列表；过滤状态下点 `>> 加入` 仍按真实 key 工作
+  - **顺带修了列错位**：原来候选树只有 `scope` / `category` 两列却塞了三个值，
+    标签被挤进「作用域」列、分类整列丢失 —— 现为 `标签 / 作用域 / 分类` 三列各就各位
+
+### 变更
+- 推测解码改为**独立启用开关**：模型页新增「启用推测解码」勾选项，不再靠填草稿路径隐式开启
+  - **草稿文件变为可选项**：模型自带草稿（MTP 权重内置于主模型）或用 ngram 时可留空，只选推测类型即可
+  - 关闭开关后 `spec-type` / `spec-draft-*` 一律不写入 preset.ini（含旧配置 params 残留）
+  - 老配置无 `draft_enabled` 字段时按旧行为推断（有草稿路径 = 已启用），无需手工迁移
+- **6 个草稿高级参数改为可选项**，放在**推测解码面板底部的「高级 (可选)」区**，
+  每项自带勾选框，不再藏在参数子表第 60+ 项里：
+  `spec-draft-device`、`spec-draft-threads`、`spec-draft-threads-batch`、
+  `spec-draft-type-k`、`spec-draft-type-v`、`spec-draft-backend-sampling`
+  - 原来被 `startswith("spec-draft-")` 一刀切排除，schema 定义了却永远用不到
+  - 上一版改放到「显示扩展参数」区，但排在 75 项里的第 64-69 位，几乎看不到 —— 已移回草稿面板
+  - **不勾 = 不写入 ini**；勾了但草稿总开关关闭时也不写入，且不丢用户设置
+  - 草稿面板专有的 13 个 key（`config.DRAFT_BOX_KEYS`，含 `spec-type`）不再在参数子表重复出现
+    （子表那份会被草稿面板的值覆盖，属于静默失效）
+- **推测解码面板里直接显示的 7 个字段，每个都加了独立勾选框**（勾了才写入 preset.ini）：
+  草稿模型 .gguf、推测类型、`n-max`、`n-min`、`p-split`、`p-min`、草稿 GPU 层数
+  - 勾选框自带字段名，取消勾选后配对控件自动置灰（视觉上即表示这项不生效）
+  - 状态存进模型配置的 `draft_en` 字段；老配置没有该字段时自动补为「全勾」，
+    等价于旧行为（开关开着就写），**零迁移、输出逐字节不变**
+  - 取消勾选的字段既不走顶层快捷字段，也不走 params 残留，ini 里彻底不出现
+
 ### 修复
+- **推测解码面板的字段勾选框，取消勾选一次就永久灰掉、再也点不回来**
+  - 根因：`_apply_draft_en` 联动置灰时，把勾选框自己也列进了禁用名单，
+    取消勾选 → 勾选框连同配对控件一起变成 `disabled` → 死锁
+  - 现在勾选框本身永远保持可点，只置灰它配对的输入控件（输入控件恢复后可编辑）
+  - 勾选框单独存放在 `_draft_en_cbs`，`_apply_draft_en` 里再加一道 `is cb` 跳过保护
+- **一个错误 key 导致整个 router-preset.ini 解析失败，所有模型都加载不了**
+  - 根因：`spec-draft-cache-type-k` / `-v` 是写错的 key，llama-server 只认
+    `spec-draft-type-k` / `-v`；preset 解析器遇到未知 key 直接放弃整个文件
+  - 实测确认：`option 'spec-draft-cache-type-k' not recognized in preset 'bad'`
+    → `failed to parse server config file` → 一个模型都加载不了
+  - 已改名，并在 `config._normalize_model` / `_ensure_model_params` 里自动迁移旧 key
+    （保留 `enabled` / `value`，新旧并存以新 key 为准，迁移幂等）
+- **同类问题治本**：新增 `config.llama_known_keys()`，按 `llama-server --help` 取本机
+  真正认识的 flag 集合（按 exe 的 mtime/size 缓存，升级 llama.cpp 自动失效）
+  - `generate_preset` 生成时跳过本机不认识的 key，UI 保存后在日志里提示被跳过的项
+  - 用户在偏好页手写的额外参数打错字，不再会毁掉整个 preset
+  - 实测本机 build 10685 不认识 `n-cpu-ffn`、`lazy-mode`，均被自动跳过
+- `tensor-read-lazy` 是写错的 key，llama-server 真名是 `lazy-mode`（已改名 + 旧 key 迁移）
 - 启动闪退：`manager-ui.bat` 崩溃时红色报错一闪而过看不清
   - 新增 `launch_ui.ps1` + `launch_ui_logged.cmd`：隐藏窗口启动 UI，stderr 写入 `logs\ui_launch.log`
   - 启动失败时窗口停住显示完整错误并暂停；正常时几秒后自动关闭
@@ -21,6 +91,22 @@
 - `show_python_missing.ps1` 在中文 Windows 上打不开
   - 加 UTF-8 BOM（PowerShell 5.1 无 BOM 按 GBK 读，中文破坏语法）
   - 修复 winget 按钮命令的嵌套引号错误，改用 `-EncodedCommand`
+- 偏好页「上移/下移」看起来无效，且顺序与模型页参数面板不一致
+  - 根因：已选常用列表始终按内置 schema 固定顺序渲染，不读 `common_keys` 的存储顺序
+  - 现在偏好页列表严格按 `common_keys` 顺序显示，与模型页常用区顺序一致
+  - 偏好页增删/移动常用参数、增删额外参数后**立即重建参数面板**，无需切页再切回
+  - 重复 key 去重保护；用户手改配置文件遗留的未知 key 不再静默丢失
+- 模型页从「启用推测解码」的模型切到未启用的模型时，草稿面板不隐藏
+  - `_sync_draft_box` 原来只看折叠状态不看启用开关，现两者都判断
+- **实时监控窗口「日志不动」**
+  - 根因一：`_tail_loop` 把整个读日志循环包在 `except Exception: continue` 里，
+    任何读取失败都被静默吞掉，界面上只表现为日志停止刷新，毫无提示
+    现在读取异常 / 日志文件不存在 / 行数，都会在窗口顶部指示器里直接写出来
+  - 根因二：「重读日志」按钮直接调用 `_refresh_ui()`，而它内部会再挂一条 `after(500)`
+    定时刷新链 —— 每点一次按钮就多一条，链成倍堆积会把界面拖垮
+    现在只做一次渲染，定时链永远只有一条
+  - 指示器文案：绿色「日志读取正常 · 已加载 N 行」/ 橙色「找不到日志: …」/
+    红色「日志读取异常 — 具体异常」
 
 ---
 

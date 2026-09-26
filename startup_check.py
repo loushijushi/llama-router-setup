@@ -189,7 +189,7 @@ def check_models() -> CheckItem:
         if mm and not os.path.isfile(mm):
             missing.append(f"[{mid}] mmproj 不存在: {mm}")
         dm = m.get("draft_model", "")
-        if dm and not os.path.isfile(dm):
+        if dm and m.get("draft_enabled", bool(dm)) and not os.path.isfile(dm):
             missing.append(f"[{mid}] 草稿模型不存在: {dm}")
     if missing:
         return CheckItem(

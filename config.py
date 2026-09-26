@@ -29,6 +29,51 @@ def preset_path_for(cfg: Dict[str, Any]) -> str:
     return os.path.join(llama_dir, "router-preset.ini")
 
 
+def llama_server_path(cfg: Dict[str, Any]) -> str:
+    llama_dir = (cfg.get("llama_dir") or r"C:\llama.cpp").rstrip("\\/")
+    return os.path.join(llama_dir, "llama-server.exe")
+
+
+# llama-server --help 认识的 flag 名缓存: {(exe, mtime, size): frozenset}
+_KNOWN_KEYS_CACHE: Dict[tuple, Optional[frozenset]] = {}
+
+# preset 解析器额外接受的 key (不以 -- 形式出现在 --help 里)
+_PRESET_BUILTIN_KEYS = frozenset({"version", "model", "alias", "mmproj"})
+
+
+def llama_known_keys(cfg: Dict[str, Any], refresh: bool = False) -> Optional[frozenset]:
+    """本机 llama-server 认识的 preset key 集合。
+
+    以 `llama-server --help` 的 --flag 名为准 (router-preset 的 key 即 CLI flag 名)。
+    拿不到时返回 None，调用方应跳过过滤 (保持旧行为)。
+    结果按 exe 的 (路径, mtime, size) 缓存，升级 llama.cpp 后自动失效。
+    """
+    exe = llama_server_path(cfg)
+    try:
+        st = os.stat(exe)
+    except OSError:
+        return None
+    ck = (os.path.abspath(exe), st.st_mtime, st.st_size)
+    if not refresh and ck in _KNOWN_KEYS_CACHE:
+        return _KNOWN_KEYS_CACHE[ck]
+
+    import re
+    import subprocess
+    try:
+        proc = subprocess.run([exe, "--help"], capture_output=True, timeout=20)
+        raw = (proc.stdout or b"") + (proc.stderr or b"")
+        text = raw.decode("utf-8", errors="replace")
+    except Exception:
+        _KNOWN_KEYS_CACHE[ck] = None
+        return None
+    if not text.strip():
+        _KNOWN_KEYS_CACHE[ck] = None
+        return None
+    keys = frozenset(set(re.findall(r"--([a-z0-9][a-z0-9\-]*)", text)) | set(_PRESET_BUILTIN_KEYS))
+    _KNOWN_KEYS_CACHE[ck] = keys
+    return keys
+
+
 def Param(key: str, label: str, default: str, *,
           kind: str = "text", scope: str = "global",
           category: str = "advanced", hint: str = "",
@@ -142,7 +187,9 @@ PARAM_SCHEMA: List[Dict[str, Any]] = [
     Param("n-cpu-moe", "前 N 层 MoE 留 CPU", "0", kind="int", scope="both", category="advanced",
           description=_D("只把前 N 层的 MoE 权重留 CPU。")),
     Param("n-cpu-ffn", "前 N 层 FFN 留 CPU", "0", kind="int", scope="both", category="advanced",
-          description=_D("稠密模型专用：把前 N 层的 FFN 权重留 CPU。")),
+          hint="需 llama.cpp 支持 -ncffn",
+          description=_D("稠密模型专用：把前 N 层的 FFN 权重留 CPU (llama-server: --n-cpu-ffn)。\n"
+                         "老版本 llama.cpp 不认识该参数, 生成 preset 时会被自动跳过并提示。")),
     Param("fit", "自动适配显存", "true", kind="bool", scope="both", category="advanced",
           description=_D("让 llama.cpp 自动调整参数以适配设备显存。")),
     Param("fit-target", "显存余量 (MiB)", "1024", kind="int", scope="both", category="advanced",
@@ -152,9 +199,10 @@ PARAM_SCHEMA: List[Dict[str, Any]] = [
     Param("load-mode", "加载模式", "auto", kind="choice", scope="both", category="advanced",
           hint="auto/mmap/mlock/dio",
           description=_D("auto 默认；mmap 内存映射；mlock 锁内存；dio 用 DirectIO。")),
-    Param("tensor-read-lazy", "懒读张量", "auto", kind="choice", scope="both", category="advanced",
-          hint="on/off/auto",
-          description=_D("对超过 4 GiB 的张量按需从磁盘读。")),
+    Param("lazy-mode", "懒读张量 (lazy-mode)", "auto", kind="choice", scope="both", category="advanced",
+          hint="on/off/auto (需 llama.cpp 支持)",
+          description=_D("对超过 4 GiB 的张量按需从磁盘读 (llama-server: --lazy-mode)。\n"
+                         "老版本 llama.cpp 不认识该参数, 生成 preset 时会被自动跳过并提示。")),
     Param("numa", "NUMA 优化", "distribute", kind="choice", scope="both", category="advanced",
           hint="distribute/isolate/numactl",
           description=_D("NUMA 架构 CPU 上的优化策略。")),
@@ -265,7 +313,9 @@ PARAM_SCHEMA: List[Dict[str, Any]] = [
           hint="auto / 99 / 0",
           description=_D("草稿模型放多少层到 GPU。")),
     Param("spec-draft-device", "草稿模型设备", "", kind="text", scope="model", category="advanced",
-          description=_D("草稿模型用哪个 GPU。留空自动。")),
+          hint="需启用推测解码",
+          description=_D("草稿模型用哪个 GPU (如 0)。留空自动。\n"
+                         "仅在「启用推测解码」勾选且本项也勾选时才写入 preset。")),
     Param("spec-draft-n-max", "草稿最大 token", "3", kind="int", scope="model", category="advanced",
           description=_D("每轮推测最多生成多少个候选 token。")),
     Param("spec-draft-n-min", "草稿最小 token", "0", kind="int", scope="model", category="advanced",
@@ -275,15 +325,25 @@ PARAM_SCHEMA: List[Dict[str, Any]] = [
     Param("spec-draft-p-min", "草稿最小概率", "0.0", kind="float", scope="model", category="advanced",
           description=_D("贪心模式下的最小接受概率。")),
     Param("spec-draft-threads", "草稿 CPU 线程", "", kind="int", scope="model", category="advanced",
-          description=_D("草稿模型用的 CPU 线程数。留空跟随主模型。")),
+          hint="需启用推测解码",
+          description=_D("草稿模型用的 CPU 线程数。留空跟随主模型。\n"
+                         "仅在「启用推测解码」勾选且本项也勾选时才写入 preset。")),
     Param("spec-draft-threads-batch", "草稿批线程", "", kind="int", scope="model", category="advanced",
-          description=_D("草稿模型批处理线程。")),
-    Param("spec-draft-cache-type-k", "草稿 KV K", "f16", kind="choice", scope="model", category="advanced",
-          description=_D("草稿模型的 K 缓存量化。f16 即可。")),
-    Param("spec-draft-cache-type-v", "草稿 KV V", "f16", kind="choice", scope="model", category="advanced",
-          description=_D("草稿模型的 V 缓存量化。")),
+          hint="需启用推测解码",
+          description=_D("草稿模型批处理线程。\n"
+                         "仅在「启用推测解码」勾选且本项也勾选时才写入 preset。")),
+    Param("spec-draft-type-k", "草稿 KV K", "f16", kind="choice", scope="model", category="advanced",
+          hint="需启用推测解码",
+          description=_D("草稿模型的 K 缓存量化 (llama-server: --spec-draft-type-k)。f16 即可。\n"
+                         "仅在「启用推测解码」勾选且本项也勾选时才写入 preset。")),
+    Param("spec-draft-type-v", "草稿 KV V", "f16", kind="choice", scope="model", category="advanced",
+          hint="需启用推测解码",
+          description=_D("草稿模型的 V 缓存量化 (llama-server: --spec-draft-type-v)。\n"
+                         "仅在「启用推测解码」勾选且本项也勾选时才写入 preset。")),
     Param("spec-draft-backend-sampling", "草稿后端采样", "true", kind="bool", scope="model", category="advanced",
-          description=_D("把草稿采样放到后端。")),
+          hint="需启用推测解码",
+          description=_D("把草稿采样放到后端 (默认 true)。\n"
+                         "仅在「启用推测解码」勾选且本项也勾选时才写入 preset。")),
     # ============== 杂项 ==============
     Param("warmup", "加载时预热", "true", kind="bool", scope="both", category="advanced",
           description=_D("加载完模型后空跑一次预热。")),
@@ -317,6 +377,46 @@ PARAM_SCHEMA: List[Dict[str, Any]] = [
 ]
 
 SCHEMA_INDEX: Dict[str, Dict[str, Any]] = {p["key"]: p for p in PARAM_SCHEMA}
+
+# 「推测解码」草稿面板 (draft_box) 专属的 key: 面板里已有控件,
+# 不在模型参数子表里重复出现 (子表那份会被 draft_* 顶层字段覆盖, 属于静默失效)。
+DRAFT_BOX_KEYS = frozenset({
+    "spec-type",
+    "spec-draft-model", "spec-draft-n-max", "spec-draft-n-min",
+    "spec-draft-p-split", "spec-draft-p-min", "spec-draft-ngl",
+    "spec-draft-device", "spec-draft-threads", "spec-draft-threads-batch",
+    "spec-draft-type-k", "spec-draft-type-v", "spec-draft-backend-sampling",
+})
+
+# 草稿面板「高级」区的 6 个可选项: 各自带勾选框, 勾了才写入 ini。
+DRAFT_OPT_KEYS = (
+    "spec-draft-device", "spec-draft-threads", "spec-draft-threads-batch",
+    "spec-draft-type-k", "spec-draft-type-v", "spec-draft-backend-sampling",
+)
+
+# 草稿面板「快捷」区直接显示的 7 个字段: 每个自带勾选框, 勾了才写入 ini。
+#   值存在顶层 draft_* 字段, 勾选状态存在 m["draft_en"]。
+#   draft_en 缺省为 True —— 老配置没这个字段时保持旧行为 (开关开着就写)。
+DRAFT_SHORTCUT_KEYS = (
+    "spec-draft-model", "spec-type",
+    "spec-draft-n-max", "spec-draft-n-min",
+    "spec-draft-p-split", "spec-draft-p-min", "spec-draft-ngl",
+)
+
+# 快捷字段: 关闭「启用推测解码」时会从 params 里清掉 (值来自 draft_* 顶层字段)。
+# 高级可选项不清 —— 只是不写 ini, 用户的勾选状态要保留。
+DRAFT_QUICK_KEYS = frozenset({
+    "spec-draft-model", "spec-draft-n-max", "spec-draft-n-min",
+    "spec-draft-p-split", "spec-draft-p-min", "spec-draft-ngl",
+})
+
+# 旧版 schema 里写错的 key -> llama-server 真正认识的 key。
+# 错的 key 会让整个 router-preset.ini 解析失败 (所有模型都加载不了)，故加载时自动迁移。
+PARAM_KEY_ALIASES = {
+    "spec-draft-cache-type-k": "spec-draft-type-k",
+    "spec-draft-cache-type-v": "spec-draft-type-v",
+    "tensor-read-lazy": "lazy-mode",
+}
 
 
 # ----------------------------------------------------------------------
@@ -424,6 +524,18 @@ def _merge_params_dict(target: Dict[str, Any], src: Any) -> None:
             target[k] = {"enabled": True, "value": "" if v is None else str(v)}
 
 
+def _migrate_param_keys(params: Dict[str, Any]) -> None:
+    """就地把写错的历史 key 换成 llama-server 认识的名字 (幂等)。"""
+    for old, new in PARAM_KEY_ALIASES.items():
+        if old not in params:
+            continue
+        if new in params:
+            # 新旧并存: 以新 key 为准，丢弃旧的
+            params.pop(old, None)
+        else:
+            params[new] = params.pop(old)
+
+
 def _normalize_model(m: Dict[str, Any]) -> Dict[str, Any]:
     base = {"params": {}}
     base.update(m)
@@ -432,12 +544,21 @@ def _normalize_model(m: Dict[str, Any]) -> Dict[str, Any]:
     base.setdefault("mmproj", "")
     base.setdefault("draft_model", "")
     base.setdefault("draft_type", "")
+    # 推测解码独立开关 (草稿文件路径是可选项, 模型自带草稿时可留空)
+    # 老配置没有该字段: 有草稿路径即视为已启用, 保持旧行为
+    base.setdefault("draft_enabled", bool(base.get("draft_model")))
     # 草稿模型专用设置项 (UI 上独立显示，不在参数子表里出现)
     base.setdefault("draft_n_max", "3")
     base.setdefault("draft_n_min", "0")
     base.setdefault("draft_p_split", "0.1")
     base.setdefault("draft_p_min", "0.0")
     base["params"] = base.get("params", {}) or {}
+    _migrate_param_keys(base["params"])
+    # 快捷字段勾选状态: 老配置没有该字段 -> 默认全勾 (等价于旧行为: 开关开着就写)
+    de = base.get("draft_en")
+    if not isinstance(de, dict):
+        de = {}
+    base["draft_en"] = {k: bool(de.get(k, True)) for k in DRAFT_SHORTCUT_KEYS}
     return base
 
 
@@ -453,6 +574,7 @@ def _ensure_model_params(m: Dict[str, Any]) -> None:
     其他默认 enabled=False，需要用户在 UI 里勾选。
     """
     params = m.setdefault("params", {})
+    _migrate_param_keys(params)
     for p in PARAM_SCHEMA:
         if p["scope"] not in ("model", "both"):
             continue
@@ -485,11 +607,11 @@ def list_kinds_choices() -> Dict[str, List[str]]:
         "rope-scaling": ["none", "linear", "yarn"],
         "cache-type-k": ["f32", "f16", "bf16", "q8_0", "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1"],
         "cache-type-v": ["f32", "f16", "bf16", "q8_0", "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1"],
-        "spec-draft-cache-type-k": ["f32", "f16", "bf16", "q8_0", "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1"],
-        "spec-draft-cache-type-v": ["f32", "f16", "bf16", "q8_0", "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1"],
+        "spec-draft-type-k": ["f32", "f16", "bf16", "q8_0", "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1"],
+        "spec-draft-type-v": ["f32", "f16", "bf16", "q8_0", "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1"],
         "split-mode": ["none", "layer", "row", "tensor"],
         "load-mode": ["auto", "none", "mmap", "mlock", "mmap+mlock", "dio"],
-        "tensor-read-lazy": ["on", "off", "auto"],
+        "lazy-mode": ["on", "off", "auto"],
         "numa": ["distribute", "isolate", "numactl"],
         "reasoning": ["on", "off", "auto"],
         "reasoning-format": ["none", "deepseek", "deepseek-legacy", "auto"],

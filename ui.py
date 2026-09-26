@@ -323,8 +323,8 @@ class ParamPanel(ttk.Frame):
         for p in config.PARAM_SCHEMA:
             if p["scope"] not in (self.scope, "both"):
                 continue
-            # model scope 下排除 spec-draft-* (草稿区有专有输入框)
-            if self.scope == "model" and p["key"].startswith("spec-draft-"):
+            # model scope 下排除草稿快捷框专有的 key, 避免重复输入
+            if self.scope == "model" and p["key"] in config.DRAFT_BOX_KEYS:
                 continue
             applicable.append(p)
         for p in config.extra_params():
@@ -392,8 +392,9 @@ class ParamPanel(ttk.Frame):
 # 偏好页
 # =========================================================================
 class PrefsTab(ttk.Frame):
-    def __init__(self, master: tk.Tk) -> None:
+    def __init__(self, master: tk.Tk, on_change: Optional[Callable[[], None]] = None) -> None:
         super().__init__(master, padding=10)
+        self._on_change = on_change
         self._build()
 
     def _build(self) -> None:
@@ -416,18 +417,51 @@ class PrefsTab(ttk.Frame):
 
         cand_box = ttk.Frame(body)
         cand_box.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 4))
-        ttk.Label(cand_box, text="所有参数 (勾选加入常用):").pack(anchor=tk.W)
-        self.cand_tree = ttk.Treeview(cand_box, columns=("scope", "category"),
+
+        # 标题 + 匹配计数
+        head = ttk.Frame(cand_box)
+        head.pack(fill=tk.X, pady=(0, 2))
+        ttk.Label(head, text="所有参数 (勾选加入常用):").pack(side=tk.LEFT)
+        self._cand_count = tk.StringVar(value="")
+        ttk.Label(head, textvariable=self._cand_count,
+                  foreground="#888").pack(side=tk.RIGHT)
+
+        # 搜索: 大小写不敏感, 匹配 key / 标签 / 作用域 / 分类
+        # 查询串开头的 - 和 -- 会被忽略 -> 搜 "-ub" / "--ubatch" / "ub" 都能命中
+        sf = ttk.Frame(cand_box)
+        sf.pack(fill=tk.X, pady=(0, 3))
+        ttk.Label(sf, text="搜索:").pack(side=tk.LEFT)
+        self.cand_query = tk.StringVar()
+        self.cand_query.trace_add("write", self._render_cand)
+        self._cand_entry = ttk.Entry(sf, textvariable=self.cand_query)
+        self._cand_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 4))
+        ttk.Button(sf, text="清空", width=6,
+                   command=lambda: self.cand_query.set("")).pack(side=tk.LEFT)
+        self._cand_entry.bind("<Return>", self._cand_jump_first)
+        ttk.Label(cand_box, text="点列头排序: 升序 → 降序 → 恢复默认",
+                  foreground="#888").pack(anchor=tk.W, pady=(0, 3))
+
+        self._cand_sort: tuple = ("order", False)  # (列, 是否倒序); order = schema 原始顺序
+        self.cand_tree = ttk.Treeview(cand_box, columns=("label", "scope", "category"),
                                       show="tree headings", selectmode="browse", height=18)
-        self.cand_tree.heading("#0", text="参数 / 标签")
-        self.cand_tree.heading("scope", text="作用域")
-        self.cand_tree.heading("category", text="分类")
-        self.cand_tree.column("scope", width=80, anchor=tk.W)
+        self.cand_tree.heading("#0", text="key",
+                               command=lambda: self._on_cand_sort("key"))
+        self.cand_tree.heading("label", text="标签",
+                               command=lambda: self._on_cand_sort("label"))
+        self.cand_tree.heading("scope", text="作用域",
+                               command=lambda: self._on_cand_sort("scope"))
+        self.cand_tree.heading("category", text="分类",
+                               command=lambda: self._on_cand_sort("category"))
+        self.cand_tree.column("#0", width=150, anchor=tk.W)
+        self.cand_tree.column("label", width=150, anchor=tk.W)
+        self.cand_tree.column("scope", width=70, anchor=tk.W)
         self.cand_tree.column("category", width=70, anchor=tk.W)
         cand_sb = ttk.Scrollbar(cand_box, orient=tk.VERTICAL, command=self.cand_tree.yview)
         self.cand_tree.configure(yscrollcommand=cand_sb.set)
         self.cand_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         cand_sb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.cand_tree.bind("<Control-f>",
+                            lambda _e: (self._cand_entry.focus_set(), "break"))
 
         mid = ttk.Frame(body)
         mid.pack(side=tk.LEFT, fill=tk.Y, padx=4)
@@ -490,18 +524,102 @@ class PrefsTab(ttk.Frame):
 
     def _refresh_common_lists(self) -> None:
         prefs = config.load_prefs()
-        common = prefs.get("common_keys", [])
-        for iid in self.cand_tree.get_children():
-            self.cand_tree.delete(iid)
+        common = list(prefs.get("common_keys", []))
         for iid in self.sel_tree.get_children():
             self.sel_tree.delete(iid)
-        for p in config.PARAM_SCHEMA:
-            if p["key"] in common:
-                self.sel_tree.insert("", tk.END, iid=p["key"], text=p["key"],
-                                     values=(p.get("label", ""),))
-            else:
-                self.cand_tree.insert("", tk.END, iid=p["key"], text=p["key"],
-                                      values=(p.get("label", ""), p.get("scope", ""), p.get("category", "")))
+        # 已选列表必须按 common_keys 的存储顺序渲染,
+        # 否则上移/下移看不出效果, 且与参数面板顺序不一致
+        label_of = {p["key"]: p.get("label", "") for p in config.PARAM_SCHEMA}
+        seen = set()
+        for k in common:
+            if k in seen:
+                continue
+            seen.add(k)
+            self.sel_tree.insert("", tk.END, iid=k, text=k,
+                                 values=(label_of.get(k, ""),))
+        # 候选列表缓存下来, 搜索/排序都基于它做, 避免反复读 schema
+        self._cand_all = [p for p in config.PARAM_SCHEMA if p["key"] not in seen]
+        self._render_cand()
+        self._notify_change()
+
+    # ----------------- 候选列表: 搜索 + 排序 -----------------
+    @staticmethod
+    def _cand_match(p: dict, q: str) -> bool:
+        return any(q in str(p.get(f, "") or "").lower()
+                   for f in ("key", "label", "scope", "category"))
+
+    def _cand_rows(self) -> List[dict]:
+        rows = list(getattr(self, "_cand_all", []))
+        q = (self.cand_query.get() if hasattr(self, "cand_query") else "").strip().lower()
+        if q:
+            q = q.lstrip("-")           # 搜 "-ub" / "--ubatch" 等价于 "ub"
+            if q:
+                rows = [p for p in rows if self._cand_match(p, q)]
+        col, rev = self._cand_sort
+        if col != "order":
+            rows = sorted(rows, key=lambda p: (str(p.get(col, "") or "").lower(),
+                                               p["key"]))
+            if rev:
+                rows.reverse()
+        return rows
+
+    def _render_cand(self, *_a) -> None:
+        """按当前搜索词 + 排序方式重建候选树 (保持滚动与选中项)。"""
+        if not hasattr(self, "cand_tree"):
+            return
+        keep = self.cand_tree.selection()
+        keep = keep[0] if keep else None
+        rows = self._cand_rows()
+        for iid in self.cand_tree.get_children():
+            self.cand_tree.delete(iid)
+        for p in rows:
+            self.cand_tree.insert("", tk.END, iid=p["key"], text=p["key"],
+                                  values=(p.get("label", ""), p.get("scope", ""),
+                                          p.get("category", "")))
+        if keep and self.cand_tree.exists(keep):
+            self.cand_tree.selection_set(keep)
+            self.cand_tree.see(keep)
+        if hasattr(self, "_cand_count"):
+            total = len(getattr(self, "_cand_all", []))
+            q = self.cand_query.get().strip()
+            self._cand_count.set(
+                f"共 {total} 项, 匹配 {len(rows)} 项" + (f" 「{q}」" if q else ""))
+        self._update_cand_headings()
+
+    def _on_cand_sort(self, col: str) -> None:
+        """点列头: 升序 -> 降序 -> 恢复 schema 默认顺序。"""
+        cur, rev = self._cand_sort
+        if cur != col:
+            self._cand_sort = (col, False)
+        elif not rev:
+            self._cand_sort = (col, True)
+        else:
+            self._cand_sort = ("order", False)
+        self._render_cand()
+
+    def _update_cand_headings(self) -> None:
+        col, rev = self._cand_sort
+        for c, t in (("#0", "key"), ("label", "标签"),
+                     ("scope", "作用域"), ("category", "分类")):
+            arrow = ""
+            if c == col:
+                arrow = " ▼" if rev else " ▲"
+            try:
+                self.cand_tree.heading(c, text=t + arrow)
+            except tk.TclError:
+                pass
+
+    def _cand_jump_first(self, _e=None):
+        """搜索框回车 -> 跳到第一条匹配项。"""
+        kids = self.cand_tree.get_children()
+        if kids:
+            self.cand_tree.selection_set(kids[0])
+            self.cand_tree.see(kids[0])
+        return "break"
+
+    def _notify_change(self) -> None:
+        if self._on_change:
+            self._on_change()
 
     def _set_all_common(self, add: bool) -> None:
         prefs = config.load_prefs()
@@ -594,6 +712,7 @@ class PrefsTab(ttk.Frame):
         prefs["extra_params"] = [p for p in prefs.get("extra_params", []) if p["key"] != sel[0]]
         config.save_prefs(prefs)
         self._refresh_extra_list()
+        self._notify_change()
 
     def _on_extra_saved(self, new_param: Dict[str, Any]) -> None:
         prefs = config.load_prefs()
@@ -607,6 +726,7 @@ class PrefsTab(ttk.Frame):
         prefs["extra_params"] = existing
         config.save_prefs(prefs)
         self._refresh_extra_list()
+        self._notify_change()
 
     def _save_extra(self) -> None:
         messagebox.showinfo("保存", "额外参数已保存。回到「全局」/「模型」页会包含这些参数。")
@@ -732,6 +852,12 @@ class MonitorWindow(tk.Toplevel):
         self._last_speed: Dict[str, Dict[str, Any]] = {}
         # 日志是否自动跟跳 (True=跟到最新, False=用户在看历史, 不自动滚)
         self._follow_tail = True
+        # tail 健康状态 (供顶部指示器显示; 之前读失败被静默吞掉, 用户只看到"日志不动")
+        self._tail_last_ok: float = 0.0   # 最近一次成功读取的时刻
+        self._tail_err: str = ""          # 最近一次读取异常
+        self._tail_missing: List[str] = []  # 当前不存在的日志文件
+        self._tail_lines: int = 0         # 已累计读到的行数
+        self._tail_read_ok: bool = False  # 本轮是否至少成功读了一个日志文件
         self._build_ui()
         # 启动后台线程
         self._log_thread = threading.Thread(target=self._tail_loop, daemon=True)
@@ -748,6 +874,11 @@ class MonitorWindow(tk.Toplevel):
         top.pack(fill=tk.X)
         ttk.Label(top, text="📊 实时监控 (类似直接命令行调用看到的输出)",
                   font=("Segoe UI", 11, "bold")).pack(side=tk.LEFT)
+        # tail 健康指示器: 日志不动时, 这里会直接写出原因 (找不到文件 / 读取异常 / 读取正常)
+        self.log_health_var = tk.StringVar(value="日志: 等待首次读取…")
+        self.log_health_lbl = ttk.Label(top, textvariable=self.log_health_var,
+                                        foreground="#555")
+        self.log_health_lbl.pack(side=tk.LEFT, padx=(14, 0))
         ttk.Button(top, text="清空日志", command=self._clear_logs).pack(side=tk.RIGHT, padx=2)
         ttk.Button(top, text="🔄 立即刷新", command=self._force_follow).pack(side=tk.RIGHT, padx=2)
         ttk.Button(top, text="🔧 重读日志", command=self._reload_logs).pack(side=tk.RIGHT, padx=2)
@@ -840,6 +971,7 @@ class MonitorWindow(tk.Toplevel):
     def _clear_logs(self) -> None:
         self._log_buffer["out"].clear()
         self._log_buffer["err"].clear()
+        self._tail_lines = 0
         self.log_text.configure(state=tk.NORMAL)
         self.log_text.delete("1.0", tk.END)
         self.log_text.configure(state=tk.DISABLED)
@@ -850,7 +982,11 @@ class MonitorWindow(tk.Toplevel):
         self._last_log_pos.clear()
         self._log_buffer["out"].clear()
         self._log_buffer["err"].clear()
-        self._refresh_ui()
+        self._tail_lines = 0
+        self._tail_err = ""
+        # 只渲染一次; 这里不能调 _refresh_ui(), 它会再挂一条 after 定时链,
+        # 每点一次按钮就多一条, 链条堆积会把界面拖垮 (表现为"日志不动")
+        self._render_logs()
         self.stat_var.set("已重置日志文件位置，正在重新读取...")
 
     def _restart_service(self) -> None:
@@ -884,8 +1020,12 @@ class MonitorWindow(tk.Toplevel):
         import time as _time
         while not self._stop:
             try:
+                missing: List[str] = []
+                err: str = ""
+                read_ok = False
                 for path in self._log_paths():
                     if not os.path.isfile(path):
+                        missing.append(os.path.basename(path))
                         continue
                     try:
                         # 先看文件大小, 处理轮转/截断的情况
@@ -902,10 +1042,14 @@ class MonitorWindow(tk.Toplevel):
                             f.seek(last_pos)
                             new_lines = f.readlines()
                             self._last_log_pos[path] = f.tell()
-                    except Exception:
+                        read_ok = True
+                    except Exception as e:
+                        # 之前这里是 continue: 读失败被静默吞掉, 界面上只表现为"日志不动"
+                        err = f"{os.path.basename(path)}: {type(e).__name__}: {e}"
                         continue
                     if not new_lines:
                         continue
+                    self._tail_lines += len(new_lines)
                     buf = self._log_buffer["out"] if path.endswith(".out.log") else self._log_buffer["err"]
                     for line in new_lines:
                         line = line.rstrip("\n")
@@ -919,8 +1063,12 @@ class MonitorWindow(tk.Toplevel):
                                 "tg_3s": float(m.group(3)),
                                 "ts": _time.time(),
                             }
-            except Exception:
-                pass
+                self._tail_missing = missing
+                self._tail_err = err
+                self._tail_read_ok = read_ok
+                self._tail_last_ok = _time.time()
+            except Exception as e:
+                self._tail_err = f"tail 循环: {type(e).__name__}: {e}"
             _time.sleep(0.3)
 
     # ----------------- 后台: HTTP 轮询 -----------------
@@ -951,6 +1099,31 @@ class MonitorWindow(tk.Toplevel):
             _time.sleep(2.0)
 
     # ----------------- UI 刷新 -----------------
+    def _update_log_health(self) -> None:
+        """顶部指示器: 直接告诉用户"日志为什么不动" (之前读失败全被静默吞掉)。"""
+        import time as _time
+        try:
+            missing = self._tail_missing
+            if self._tail_err:
+                self.log_health_var.set(f"⚠ 日志读取异常 — {self._tail_err}")
+                self.log_health_lbl.configure(foreground="#cc0000")
+            elif self._tail_read_ok:
+                # 至少有一个日志读成功 -> 正常; 另一个不存在是常见情况 (服务没报错)
+                note = f" · 缺 {'+'.join(missing)}" if missing else ""
+                self.log_health_var.set(
+                    f"日志读取正常 · 已加载 {self._tail_lines} 行{note}")
+                self.log_health_lbl.configure(foreground="#00aa00")
+            elif missing:
+                self.log_health_var.set(f"⚠ 找不到日志: {' + '.join(missing)}")
+                self.log_health_lbl.configure(foreground="#cc0000")
+            else:
+                age = _time.time() - self._tail_last_ok if self._tail_last_ok else 999
+                self.log_health_var.set(
+                    f"⚠ 日志 {age:.0f} 秒没有更新 (文件未增长, 服务可能空闲)")
+                self.log_health_lbl.configure(foreground="#cc6600")
+        except Exception:
+            pass
+
     def _refresh_ui(self) -> None:
         if self._stop:
             return
@@ -961,6 +1134,7 @@ class MonitorWindow(tk.Toplevel):
             self._render_status()
         except Exception as e:
             self.stat_var.set(f"渲染异常: {e}")
+        self._update_log_health()
         self.after(500, self._refresh_ui)
 
     def _force_follow(self) -> None:
@@ -1673,16 +1847,25 @@ class App(tk.Tk):
         box1.columnconfigure(2, weight=1)
         box1.columnconfigure(3, weight=0)
 
-        # ===== 推测解码 (默认折叠, 用按钮展开) =====
+        # ===== 推测解码 (独立启用开关, 默认折叠, 用按钮展开) =====
         # 占 0 空间, 给参数面板更多位置
         draft_toggle_bar = ttk.Frame(master)
         draft_toggle_bar.pack(fill=tk.X, padx=4, pady=(0, 2))
-        self._draft_collapsed = tk.BooleanVar(value=False)
+        self.var_draft_enabled = tk.BooleanVar(value=False)
         ttk.Checkbutton(draft_toggle_bar,
-                        text="▾  推测解码 (Draft Model)  —— MTP / DFlash (点此折叠)",
+                        text="启用推测解码 (MTP / DFlash / ngram)",
+                        variable=self.var_draft_enabled,
+                        command=self._on_draft_enable_toggle
+                        ).pack(side=tk.LEFT, padx=(4, 12))
+        self._draft_collapsed = tk.BooleanVar(value=False)
+        self._draft_collapse_cb = ttk.Checkbutton(draft_toggle_bar,
+                        text="▾  详细设置 (点此折叠)",
                         variable=self._draft_collapsed,
                         command=self._toggle_draft_box
-                        ).pack(side=tk.LEFT)
+                        )
+        self._draft_collapse_cb.pack(side=tk.LEFT)
+        # 启用开关默认关 -> 详细面板先禁用折叠按钮, 不显示
+        self._draft_collapse_cb.configure(state="disabled")
         self.draft_box = ttk.LabelFrame(master, text="推测解码 (Draft Model)", padding=6)
         self.var_draft_model = tk.StringVar()
         self.var_draft_type = tk.StringVar()
@@ -1691,41 +1874,131 @@ class App(tk.Tk):
         self.var_draft_p_split = tk.StringVar(value="0.1")
         self.var_draft_p_min = tk.StringVar(value="0.0")
         self.var_draft_ngl = tk.StringVar(value="auto")
-        # 第 0 行: 草稿模型路径
-        ttk.Label(self.draft_box, text="草稿模型 .gguf:").grid(row=0, column=0, sticky=tk.W, pady=3, padx=(0, 6))
-        ttk.Entry(self.draft_box, textvariable=self.var_draft_model).grid(row=0, column=1, columnspan=2, sticky=tk.EW, pady=3)
-        ttk.Button(self.draft_box, text="浏览...",
-                   command=lambda: self._browse(self.var_draft_model, "gguf")).grid(row=0, column=3, padx=4)
+        # 每个快捷字段前面一个勾选框: 勾了才写入 preset.ini (draft_en 存进模型配置)
+        self.var_draft_en: Dict[str, Any] = {
+            k: tk.BooleanVar(value=True) for k in config.DRAFT_SHORTCUT_KEYS
+        }
+        self._draft_en_widgets: Dict[str, List[Any]] = {}
+        self._draft_en_cbs: Dict[str, Any] = {}  # 勾选框本身 (永远保持可点)
+
+        def _cb(row_key: str, text: str, row: int, col: int = 0,
+                col_span: int = 1) -> None:
+            """快捷字段的勾选框 (框内文字即字段名) + 联动禁用配对控件。
+
+            注意: 勾选框本身**不能**进 _draft_en_widgets, 否则取消勾选时
+            会连自己一起置灰, 用户再也点不回来 (实测 bug)。
+            """
+            cb = ttk.Checkbutton(self.draft_box, text=text,
+                                 variable=self.var_draft_en[row_key],
+                                 command=self._apply_draft_en)
+            cb.grid(row=row, column=col, columnspan=col_span,
+                    sticky=tk.W, pady=3, padx=(0, 4))
+            self._draft_en_cbs[row_key] = cb
+
+        def _pair(row_key: str, widget) -> None:
+            self._draft_en_widgets.setdefault(row_key, []).append(widget)
+
+        # 第 0 行: 草稿模型路径 (可选项 — 模型自带草稿时留空)
+        _cb("spec-draft-model", "草稿模型 .gguf (可选):", 0)
+        _e = ttk.Entry(self.draft_box, textvariable=self.var_draft_model)
+        _e.grid(row=0, column=1, columnspan=2, sticky=tk.EW, pady=3)
+        _pair("spec-draft-model", _e)
+        _b = ttk.Button(self.draft_box, text="浏览...",
+                        command=lambda: self._browse(self.var_draft_model, "gguf"))
+        _b.grid(row=0, column=3, padx=4)
+        _pair("spec-draft-model", _b)
         # 第 1 行: 推测类型 + 提示
-        ttk.Label(self.draft_box, text="推测类型:").grid(row=1, column=0, sticky=tk.W, pady=3, padx=(0, 6))
-        ttk.Combobox(self.draft_box, textvariable=self.var_draft_type, width=14,
-                     values=self._choices["spec-type"]).grid(row=1, column=1, sticky=tk.W, pady=3)
-        ttk.Label(self.draft_box, text="(留空按文件名自动猜)",
-                  foreground="#888").grid(row=1, column=2, columnspan=2, padx=4, sticky=tk.W)
+        _cb("spec-type", "推测类型:", 1)
+        _c = ttk.Combobox(self.draft_box, textvariable=self.var_draft_type, width=14,
+                          values=self._choices["spec-type"])
+        _c.grid(row=1, column=1, sticky=tk.W, pady=3)
+        _pair("spec-type", _c)
+        ttk.Label(self.draft_box, text="(留空按文件名自动猜; 无草稿文件时请选类型)",
+                  foreground="#888").grid(row=1, column=2, columnspan=2,
+                                          padx=4, sticky=tk.W)
         # 第 2 行: n-max / n-min
-        ttk.Label(self.draft_box, text="n-max:").grid(row=2, column=0, sticky=tk.W, pady=3, padx=(0, 6))
-        ttk.Spinbox(self.draft_box, textvariable=self.var_draft_n_max, width=8, from_=1, to=16).grid(
-            row=2, column=1, sticky=tk.W, pady=3)
-        ttk.Label(self.draft_box, text="n-min:").grid(row=2, column=2, sticky=tk.W, pady=3, padx=(8, 6))
-        ttk.Spinbox(self.draft_box, textvariable=self.var_draft_n_min, width=8, from_=0, to=16).grid(
-            row=2, column=3, sticky=tk.W, pady=3)
+        _cb("spec-draft-n-max", "n-max:", 2, col=0)
+        _s = ttk.Spinbox(self.draft_box, textvariable=self.var_draft_n_max, width=8,
+                         from_=1, to=16)
+        _s.grid(row=2, column=1, sticky=tk.W, pady=3)
+        _pair("spec-draft-n-max", _s)
+        _cb("spec-draft-n-min", "n-min:", 2, col=2)
+        _s = ttk.Spinbox(self.draft_box, textvariable=self.var_draft_n_min, width=8,
+                         from_=0, to=16)
+        _s.grid(row=2, column=3, sticky=tk.W, pady=3)
+        _pair("spec-draft-n-min", _s)
         # 第 3 行: p-split / p-min
-        ttk.Label(self.draft_box, text="p-split:").grid(row=3, column=0, sticky=tk.W, pady=3, padx=(0, 6))
-        ttk.Spinbox(self.draft_box, textvariable=self.var_draft_p_split, width=8, from_=0.0, to=1.0, increment=0.05).grid(
-            row=3, column=1, sticky=tk.W, pady=3)
-        ttk.Label(self.draft_box, text="p-min:").grid(row=3, column=2, sticky=tk.W, pady=3, padx=(8, 6))
-        ttk.Spinbox(self.draft_box, textvariable=self.var_draft_p_min, width=8, from_=0.0, to=1.0, increment=0.05).grid(
-            row=3, column=3, sticky=tk.W, pady=3)
+        _cb("spec-draft-p-split", "p-split:", 3, col=0)
+        _s = ttk.Spinbox(self.draft_box, textvariable=self.var_draft_p_split, width=8,
+                         from_=0.0, to=1.0, increment=0.05)
+        _s.grid(row=3, column=1, sticky=tk.W, pady=3)
+        _pair("spec-draft-p-split", _s)
+        _cb("spec-draft-p-min", "p-min:", 3, col=2)
+        _s = ttk.Spinbox(self.draft_box, textvariable=self.var_draft_p_min, width=8,
+                         from_=0.0, to=1.0, increment=0.05)
+        _s.grid(row=3, column=3, sticky=tk.W, pady=3)
+        _pair("spec-draft-p-min", _s)
         # 第 4 行: ngl
-        ttk.Label(self.draft_box, text="草稿 GPU 层数:").grid(row=4, column=0, sticky=tk.W, pady=3, padx=(0, 6))
-        ttk.Combobox(self.draft_box, textvariable=self.var_draft_ngl, width=14,
-                     values=self._choices["spec-draft-ngl"]).grid(row=4, column=1, sticky=tk.W, pady=3)
+        _cb("spec-draft-ngl", "草稿 GPU 层数:", 4)
+        _c = ttk.Combobox(self.draft_box, textvariable=self.var_draft_ngl, width=14,
+                          values=self._choices["spec-draft-ngl"])
+        _c.grid(row=4, column=1, sticky=tk.W, pady=3)
+        _pair("spec-draft-ngl", _c)
         ttk.Label(self.draft_box, text="(auto 自动, 0 纯 CPU, 99 全 GPU)",
-                  foreground="#888").grid(row=4, column=2, columnspan=2, padx=4, sticky=tk.W)
+                  foreground="#888").grid(row=4, column=2, columnspan=2,
+                                          padx=4, sticky=tk.W)
+
+        # ===== 高级可选项: 每项独立勾选, 勾了才写入 ini =====
+        ttk.Separator(self.draft_box, orient=tk.HORIZONTAL).grid(
+            row=5, column=0, columnspan=4, sticky=tk.EW, pady=(6, 3))
+        ttk.Label(self.draft_box, text="高级 (可选, 勾选后才写入 preset.ini)",
+                  foreground="#555").grid(row=6, column=0, columnspan=4,
+                                          sticky=tk.W, pady=(0, 2))
+        self.var_draft_opt: Dict[str, Any] = {}
+        for i, key in enumerate(config.DRAFT_OPT_KEYS):
+            meta = config.SCHEMA_INDEX.get(key, {})
+            en = tk.BooleanVar(value=False)
+            va = tk.StringVar(value=str(meta.get("default", "")))
+            self.var_draft_opt[key] = (en, va)
+            r = 7 + i
+            ttk.Checkbutton(self.draft_box, variable=en).grid(
+                row=r, column=0, sticky=tk.W, pady=2, padx=(0, 2))
+            ttk.Label(self.draft_box, text=meta.get("label", key)).grid(
+                row=r, column=1, sticky=tk.W, pady=2, padx=(0, 6))
+            kind = meta.get("kind", "text")
+            if kind == "choice":
+                ttk.Combobox(self.draft_box, textvariable=va, width=14,
+                             values=self._choices.get(key, [])).grid(
+                    row=r, column=2, sticky=tk.W, pady=2)
+            elif kind == "bool":
+                ttk.Combobox(self.draft_box, textvariable=va, width=8,
+                             values=["true", "false"]).grid(
+                    row=r, column=2, sticky=tk.W, pady=2)
+            else:
+                ttk.Entry(self.draft_box, textvariable=va, width=16).grid(
+                    row=r, column=2, sticky=tk.W, pady=2)
+            if meta.get("hint"):
+                ttk.Label(self.draft_box, text=meta["hint"],
+                          foreground="#888").grid(row=r, column=3,
+                                                  sticky=tk.W, padx=(8, 0))
         self.draft_box.columnconfigure(1, weight=1)
-        # 默认展开: 立刻 pack 一次 (如果默认 False, 用户需要在 _toggle_draft_box 手动调)
-        if not self._draft_collapsed.get():
-            self.draft_box.pack(fill=tk.X, padx=4, pady=(0, 4))
+        # 初始不显示: 由 _on_select_model 按 draft_enabled 同步 (启用开关默认关)
+
+    def _apply_draft_en(self) -> None:
+        """快捷字段勾选框 -> 联动禁用/恢复配对控件 (视觉上也表示这项不生效)。
+
+        勾选框本身永远保持可点: 一旦它也被置灰, 用户取消勾选后就再也改不回来。
+        """
+        for key, widgets in self._draft_en_widgets.items():
+            on = bool(self.var_draft_en[key].get())
+            cb = self._draft_en_cbs.get(key)
+            for w in widgets:
+                if w is cb:
+                    continue
+                try:
+                    w.configure(state="normal" if on else "disabled")
+                except tk.TclError:
+                    pass
 
     def _build_model_params_panel(self, master: ttk.Frame) -> None:
         """右侧面板: 仅显示模型参数 (占满全部高度)。"""
@@ -1740,19 +2013,34 @@ class App(tk.Tk):
         self._param_panels.append(self.model_param_panel)
         self.model_param_panel.pack(fill=tk.BOTH, expand=True)
 
-    def _toggle_draft_box(self) -> None:
-        """展开/折叠推测解码面板。"""
-        if self._draft_collapsed.get():
-            # 折叠 -> 移除
+    def _on_draft_enable_toggle(self) -> None:
+        """启用/停用推测解码: 控制折叠按钮可用性与面板显示。"""
+        enabled = bool(self.var_draft_enabled.get())
+        self._draft_collapse_cb.configure(state="normal" if enabled else "disabled")
+        if not enabled:
             self.draft_box.pack_forget()
         else:
-            # 展开 -> 插在 toggle bar 和 box3 (模型参数) 之间
-            for w in self._editor_master.winfo_children():
-                if isinstance(w, ttk.LabelFrame) and w.cget("text") == "模型参数":
-                    self.draft_box.pack(fill=tk.X, padx=4, pady=(0, 4), before=w)
-                    return
-            # 找不到就 fallback
-            self.draft_box.pack(fill=tk.X, padx=4, pady=(0, 4))
+            self._sync_draft_box()
+
+    def _toggle_draft_box(self) -> None:
+        """展开/折叠推测解码面板。"""
+        if not self.var_draft_enabled.get():
+            self.draft_box.pack_forget()
+            return
+        self._sync_draft_box()
+
+    def _sync_draft_box(self) -> None:
+        """按启用开关 + 折叠状态显示/隐藏推测解码面板。"""
+        if not self.var_draft_enabled.get() or self._draft_collapsed.get():
+            self.draft_box.pack_forget()
+            return
+        # 展开 -> 插在 toggle bar 和 box3 (模型参数) 之间
+        for w in self._editor_master.winfo_children():
+            if isinstance(w, ttk.LabelFrame) and w.cget("text") == "模型参数":
+                self.draft_box.pack(fill=tk.X, padx=4, pady=(0, 4), before=w)
+                return
+        # 找不到就 fallback
+        self.draft_box.pack(fill=tk.X, padx=4, pady=(0, 4))
 
     def _get_model_param(self, key: str) -> Dict[str, Any]:
         sel = self.model_list.curselection()
@@ -1795,6 +2083,7 @@ class App(tk.Tk):
         self.var_base_url.set(m.get("base_url", ""))
         self.var_api_key.set(m.get("api_key", ""))
         self.var_enabled.set(bool(m.get("enabled", True)))
+        self.var_draft_enabled.set(bool(m.get("draft_enabled", bool(m.get("draft_model")))))
         self.var_draft_model.set(m.get("draft_model", ""))
         self.var_draft_type.set(m.get("draft_type", ""))
         self.var_draft_n_max.set(str(m.get("draft_n_max", "3")))
@@ -1802,6 +2091,11 @@ class App(tk.Tk):
         self.var_draft_p_split.set(str(m.get("draft_p_split", "0.1")))
         self.var_draft_p_min.set(str(m.get("draft_p_min", "0.0")))
         self.var_draft_ngl.set(str(m.get("draft_ngl", "auto")))
+        # 快捷字段勾选状态 (老配置无 draft_en -> 全勾)
+        de = m.get("draft_en") or {}
+        for key, var in self.var_draft_en.items():
+            var.set(bool(de.get(key, True)))
+        self._apply_draft_en()
         # 兼容老 cfg：草稿参数可能在 params 里
         pmap = m.get("params", {}) or {}
         if "spec-draft-n-max" in pmap and not m.get("draft_n_max"):
@@ -1816,6 +2110,19 @@ class App(tk.Tk):
             v = str(pmap["spec-draft-ngl"].get("value", "auto"))
             if v and v != "auto":
                 self.var_draft_ngl.set(v)
+        # 高级可选项: 勾选状态 + 值都从 params 读
+        for key, (en, va) in self.var_draft_opt.items():
+            node = pmap.get(key)
+            if isinstance(node, dict):
+                en.set(bool(node.get("enabled", False)))
+                if node.get("value") not in (None, ""):
+                    va.set(str(node["value"]))
+            else:
+                en.set(False)
+        # 同步推测解码面板可见性 (按启用开关 + 折叠状态)
+        self._draft_collapse_cb.configure(
+            state="normal" if self.var_draft_enabled.get() else "disabled")
+        self._sync_draft_box()
         self.model_param_panel.reload()
 
     def _on_add_model(self) -> None:
@@ -1828,9 +2135,11 @@ class App(tk.Tk):
             new_id = f"{base}-{idx}"
         m = {"id": new_id, "alias": new_id, "model": "", "mmproj": "",
              "base_url": "", "api_key": "",
+             "draft_enabled": False,
              "draft_model": "", "draft_type": "",
              "draft_n_max": "3", "draft_n_min": "0",
              "draft_p_split": "0.1", "draft_p_min": "0.0", "draft_ngl": "auto",
+             "draft_en": {k: True for k in config.DRAFT_SHORTCUT_KEYS},
              "enabled": True, "params": {}}
         config._ensure_model_params(m)
         self.cfg["models"].append(m)
@@ -1874,6 +2183,7 @@ class App(tk.Tk):
         m["base_url"] = self.var_base_url.get().strip()   # 留空表示用本机
         m["api_key"] = self.var_api_key.get().strip()     # 留空表示无
         m["enabled"] = bool(self.var_enabled.get())
+        m["draft_enabled"] = bool(self.var_draft_enabled.get())
         m["draft_model"] = self.var_draft_model.get().strip()
         m["draft_type"] = self.var_draft_type.get().strip()
         m["draft_n_max"] = self.var_draft_n_max.get().strip() or "3"
@@ -1881,16 +2191,39 @@ class App(tk.Tk):
         m["draft_p_split"] = self.var_draft_p_split.get().strip() or "0.1"
         m["draft_p_min"] = self.var_draft_p_min.get().strip() or "0.0"
         m["draft_ngl"] = self.var_draft_ngl.get().strip() or "auto"
+        # 快捷字段勾选状态 (每个字段独立决定写不写 ini)
+        m["draft_en"] = {k: bool(v.get()) for k, v in self.var_draft_en.items()}
         # 同步到 params 字典 (给 generate_preset 写 ini 使用)
+        # 启用后草稿文件可选: 无路径时只写 spec-type 等其余草稿参数
         params = m.setdefault("params", {})
-        if m["draft_model"]:
-            params["spec-draft-model"] = {"enabled": True, "value": m["draft_model"]}
-            params["spec-draft-n-max"] = {"enabled": True, "value": m["draft_n_max"]}
-            params["spec-draft-n-min"] = {"enabled": True, "value": m["draft_n_min"]}
-            params["spec-draft-p-split"] = {"enabled": True, "value": m["draft_p_split"]}
-            params["spec-draft-p-min"] = {"enabled": True, "value": m["draft_p_min"]}
+        # 高级可选项: 勾选状态直接落进 params (受草稿总开关抑制, 由 generate_preset 把关)
+        for key, (en, va) in self.var_draft_opt.items():
+            params[key] = {"enabled": bool(en.get()),
+                           "value": va.get().strip()}
+        if m["draft_enabled"]:
+            en = m["draft_en"]
+            if m["draft_model"]:
+                params["spec-draft-model"] = {
+                    "enabled": bool(en.get("spec-draft-model", True)),
+                    "value": m["draft_model"]}
+            else:
+                params.pop("spec-draft-model", None)
+            params["spec-draft-n-max"] = {"enabled": bool(en.get("spec-draft-n-max", True)),
+                                          "value": m["draft_n_max"]}
+            params["spec-draft-n-min"] = {"enabled": bool(en.get("spec-draft-n-min", True)),
+                                          "value": m["draft_n_min"]}
+            params["spec-draft-p-split"] = {"enabled": bool(en.get("spec-draft-p-split", True)),
+                                            "value": m["draft_p_split"]}
+            params["spec-draft-p-min"] = {"enabled": bool(en.get("spec-draft-p-min", True)),
+                                          "value": m["draft_p_min"]}
             if m["draft_ngl"]:
-                params["spec-draft-ngl"] = {"enabled": True, "value": m["draft_ngl"]}
+                params["spec-draft-ngl"] = {"enabled": bool(en.get("spec-draft-ngl", True)),
+                                            "value": m["draft_ngl"]}
+        else:
+            # 关闭开关 -> 清掉草稿快捷参数 (值来自顶层 draft_* 字段), 不写入 preset。
+            # 高级可选项保留勾选状态, 由 generate_preset 按总开关抑制输出。
+            for k in config.DRAFT_QUICK_KEYS:
+                params.pop(k, None)
         if not m["id"]:
             messagebox.showerror("错误", "模型 ID 不能为空")
             return
@@ -1901,6 +2234,11 @@ class App(tk.Tk):
         if ids.count(m["id"]) > 1:
             messagebox.showerror("错误", f"模型 ID 重复: {m['id']}")
             return
+        if m["draft_enabled"] and not m["draft_model"] and not m["draft_type"]:
+            messagebox.showwarning(
+                "提示",
+                "已启用推测解码, 但既未选择推测类型也未指定草稿文件。\n"
+                "模型自带草稿时请在「推测类型」里选 (如 draft-mtp / ngram-simple)。")
         self.model_param_panel.save_all()
         self._save_config()
         self._refresh_model_list(select=idx)
@@ -1912,7 +2250,7 @@ class App(tk.Tk):
             mid = m.get("id", "?")
             alias = m.get("alias", "")
             tag = " (停用)" if not m.get("enabled", True) else ""
-            draft = " ⚡草稿" if m.get("draft_model") else ""
+            draft = " ⚡草稿" if m.get("draft_enabled", m.get("draft_model")) else ""
             self.model_list.insert(tk.END, f"[{mid}] {alias}{tag}{draft}")
         if select is not None and 0 <= select < self.model_list.size():
             self.model_list.selection_set(select)
@@ -2061,7 +2399,12 @@ class App(tk.Tk):
     def _build_prefs_tab(self) -> None:
         f = ttk.Frame(self.nb, padding=0)
         self.nb.add(f, text="偏好")
-        PrefsTab(f).pack(fill=tk.BOTH, expand=True)
+        PrefsTab(f, on_change=self._on_prefs_changed).pack(fill=tk.BOTH, expand=True)
+
+    def _on_prefs_changed(self) -> None:
+        """偏好页常用区有增删/移动 -> 立即按新顺序重建参数面板。"""
+        for p in self._param_panels:
+            p.reload()
 
     def _refresh_all(self) -> None:
         self.var_llama_dir.set(self.cfg.get("llama_dir", r"C:\llama.cpp"))
@@ -2081,8 +2424,14 @@ class App(tk.Tk):
         if hasattr(self, "model_param_panel"):
             self.model_param_panel.save_all()
         config.save(self.cfg)
-        preset_path = generate_preset.generate(self.cfg)
+        skipped: list = []
+        preset_path = generate_preset.generate(self.cfg, skipped=skipped)
         self._log(f"已写入 {config.CONFIG_PATH} 并重新生成 {preset_path}")
+        if skipped:
+            # 这些 key 本机 llama-server 不认识。若照写会让整个 preset 解析失败,
+            # 所有模型都加载不了 —— 所以生成时跳过并在此提醒用户。
+            self._log("注意: 本机 llama-server 不支持以下参数, 已跳过未写入: "
+                      + ", ".join(skipped))
 
     def _log(self, msg: str) -> None:
         self.log.insert(tk.END, msg + "\n")

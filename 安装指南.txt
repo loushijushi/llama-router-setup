@@ -42,8 +42,8 @@ test-router.bat        测试所有启用模型的切换
      a) 「全局」页：检查 llama_dir 是否指向你的 llama.cpp 目录
         （含 llama-server.exe 的那个目录）
      b) 「全局」页：按需调整端口、空闲卸载时间等
-     c) 「模型」页：增删改模型条目；可以填多模态 mmproj 路径
-        以及 MTP/DFlash 草稿模型路径
+     c) 「模型」页：增删改模型条目；可以填多模态 mmproj 路径；
+        推测解码用「启用推测解码」勾选开启，草稿文件可选
      d) 切到「服务」页 → 点「安装服务」
      e) 等待「服务已安装并启动」
 
@@ -67,13 +67,30 @@ test-router.bat        测试所有启用模型的切换
   * alias       API 请求里填的 model 名，简洁好记
   * model       主模型 .gguf 绝对路径
   * mmproj      多模态投影文件（视觉模型需要）
-  * 草稿模型    MTP/DFlash 草稿 .gguf 路径（启用推测解码）
-  * 草稿类型    留空按文件名猜 (mtp-/dflash-/dspark-)，
-                也可手动选 draft-mtp / draft-dflash 等
-  * 启用        取消勾选 = 不加入 preset.ini（暂不用）
-  * 参数子表    每个参数有「启用开关 + 值」两个控件：
-                启用 + 填值 → 才会写入 ini
-                取消启用 → 该参数不写入，沿用 llama.cpp 默认
+  * 推测解码    勾选「启用推测解码」独立开关
+  * 草稿模型    MTP/DFlash 草稿 .gguf 路径（可选：模型自带
+                草稿权重时留空）
+   * 草稿类型    留空按文件名猜 (mtp-/dflash-/dspark-)，
+                 也可手动选 draft-mtp / draft-dflash 等；
+                 无草稿文件时必须手动选类型
+   * 启用        取消勾选 = 不加入 preset.ini（暂不用）
+   * 参数子表    每个参数有「启用开关 + 值」两个控件：
+                 启用 + 填值 → 才会写入 ini
+                 取消启用 → 该参数不写入，沿用 llama.cpp 默认
+    * 草稿高级参数  草稿面板底部「高级 (可选)」六项，各自带勾选框：
+                  spec-draft-device / threads / threads-batch /
+                  type-k / type-v / backend-sampling
+                  勾选 + 填值 → 才写入 ini；不勾就不写，
+                  草稿总开关关闭时一律不写入（设置保留）
+    * 推测类型    草稿面板里的「推测类型」= spec-type，
+                  参数子表不再重复出现（子表那份会被面板值覆盖）
+    * 快捷参数勾选  草稿面板里直接显示的 7 项，每项自带勾选框：
+                  草稿模型 .gguf / 推测类型 / n-max / n-min /
+                  p-split / p-min / 草稿 GPU 层数
+                  勾选 → 才写入 preset.ini；取消勾选 → 这行彻底不写，
+                  且该项控件自动置灰。设置保存在模型配置里，
+                  重新选中该模型会原样回读。老配置默认全部勾选，
+                  与升级前的输出完全一致。
 
 六、显存与空闲策略
 ----------------
@@ -124,8 +141,17 @@ Q8: 想要 UI 没有的高级参数
 A8: 任何 llama-server 支持的 CLI 参数都可以加到 config.json
     的 model.params 里 (key 要和 CLI 一致
     如 spec-draft-n-max)，并在 UI 里勾选启用。
+    注意：保存时 UI 会用本机 llama-server --help 核对一遍，
+    本机版本不认识的 key 会被自动跳过不写入 ini（日志里会列出）。
+    这是有意的 —— 一个不认识的 key 会让整个 router-preset.ini
+    解析失败，所有模型都加载不了。
 
-Q9: 其它程序需要 GPU 显存时怎么办
+Q9: 保存后日志提示「本机 llama-server 不支持以下参数」
+A9: 你的 llama.cpp 版本较老，还没编译进这些参数（如 n-cpu-ffn、
+    lazy-mode）。它们已从 preset 里跳过，其余参数不受影响。
+    升级 llama.cpp 后重新保存即可恢复写入。
+
+Q10: 其它程序需要 GPU 显存时怎么办
 A9: 三层机制按优先级：
     ① 启用 watchdog 守护：「全局」→ watchdog → 启用 → 「服务」→ 安装 watchdog
     ② llama.cpp router 自身：切换模型时旧模型自动腾 slot
