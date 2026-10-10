@@ -85,12 +85,11 @@ def render(cfg: Dict[str, Any], known: Optional[Set[str]] = None,
     for m in cfg.get("models", []):
         if not m.get("enabled", True):
             continue
-        # KVMem / Strata / FreeToken 档位走各自独立的引擎进程, 不进主路由的池子。
+        # KVMem / Strata 档位走各自独立的引擎进程, 不进主路由的池子。
         # 主 llama-server (b11200) 不认识 --kvmem-*, 写进来会让整个
         # router-preset.ini 解析失败 -> 所有模型都加载不了。这道闸门是硬防线。
-        # (Strata / FreeToken 更是完全不吃 llama flag: 前者参数在 strata-*.json 里,
-        #  后者的模型根本是目录。)
-        if m.get("runtime") in ("kvmem", "strata", "freetoken"):
+        # (Strata 更是完全不吃 llama flag: 它的参数在 strata-*.json 里。)
+        if m.get("runtime") in ("kvmem", "strata"):
             continue
         mid = m.get("id", "").strip()
         if not mid:

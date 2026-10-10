@@ -193,9 +193,9 @@ def _kill_old_gateways(include_nssm_child: bool = False) -> None:
 
 
 def serve_mode_of(cfg) -> str:
-    """当前运行时: "router" (主池) / "kvmem" / "strata" / "freetoken"。"""
+    """当前运行时: "router" (主池) / "kvmem" / "strata"。"""
     mode = str((cfg or {}).get("serve_mode") or "router").strip().lower()
-    return mode if mode in ("kvmem", "strata", "freetoken") else "router"
+    return mode if mode in ("kvmem", "strata") else "router"
 
 
 def gateway_base_url(cfg) -> str:

@@ -38,7 +38,7 @@ import time
 from typing import Callable, Dict, List, Optional
 
 # ---------------------------------------------------------------- 阈值 (用户定)
-# 显存掉一半才算「对方主动让了」。不要调得更严: FreeToken / Strata 关掉模型
+# 显存掉一半才算「对方主动让了」。不要调得更严: Strata 关掉模型
 # 后显存不一定归零 —— 桌面版本身、别的模型、CUDA context 都还占着一点。
 VRAM_DROP_RATIO = 0.50
 # GPU 利用率低于 20% 算空闲。刻意放宽, 因为瞬时采样抖得厉害。

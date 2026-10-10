@@ -3,7 +3,7 @@
 
 为什么要它
 ----------
-config.json 里的模型分四组, 它们跑在**四个不同的运行时**上:
+config.json 里的模型分三组, 它们跑在**三个不同的运行时**上:
 
   * 主池 (默认组)  -> llama-server.exe, router 模式 (--models-preset),
                       `/v1/models` 只列主池, 组内切换由 router 自己完成;
@@ -12,36 +12,33 @@ config.json 里的模型分四组, 它们跑在**四个不同的运行时**上:
   * Strata 档位    -> C:\\Strata 的 serve/server.py (自带 OpenAI 兼容层),
                       单模型进程, 参数全在 strata-<档位>.json 里,
                       压根不吃 llama flag; 加载 35-55GB 到内存, 起步 1-3 分钟。
-  * FreeToken 档位 -> freetoken 包的 `ft serve` (自带 OpenAI + Anthropic
-                      兼容层), 单模型进程, 模型是**目录**, 参数是它自己的
-                      flag (--moe-backend / --memory-ratio ...)。
 
-本机只有 16GB 显存, 四组不可能同时常驻。所以由本进程占住对外端口
+本机只有 16GB 显存, 三组不可能同时常驻。所以由本进程占住对外端口
 (cfg.host:cfg.port, 默认 0.0.0.0:18080), 把请求按 `model` 字段路由:
 
-  /v1/models          -> 读 config.json 合成, 四组模型都列出来
-                         (tags 里是 pool / kvmem / strata / freetoken)
+  /v1/models          -> 读 config.json 合成, 三组模型都列出来
+                         (tags 里是 pool / kvmem / strata)
   /models, /props     -> 同上 (老接口): /props 还会把后端自报的
                          role 改写成 router, 否则前端会退化成单模型界面;
-                         Strata / FreeToken 没有这个接口, 网关自己合成一份
+                         Strata 没有这个接口, 网关自己合成一份
   /models/sse         -> 网关端这条流: 主池原生流逐块中继, 单模型组没有这个
                          接口就自己按 /v1/models 合成状态事件
-                         (Strata 取 /health.loaded, FreeToken 取 /health.status)
-  /models/load|unload -> 按 model 切组; 单模型组 (KVMem/Strata/FreeToken) 没有
+                         (Strata 取 /health.loaded)
+  /models/load|unload -> 按 model 切组; 单模型组 (KVMem/Strata) 没有
                          这两个接口, 网关代答 (unload = 整个停掉进程)
   其它 (含 /v1/*, /v1/messages) -> 找到 model 属于哪一组, 确保那一组的后端
                          在跑, 再把请求原样转发 (支持 SSE 流式)
   /health             -> 网关自己的健康状态 + 当前后端
 
-Strata / FreeToken 活跃时网关**完全让路**: 它们的接口原样转发, 一个字节都
-不改 (PASSTHROUGH_GROUPS), 网关只负责停掉其它占资源的后端 + 转请求。
+Strata 活跃时网关**完全让路**: 它的接口原样转发, 一个字节都不改
+(PASSTHROUGH_GROUPS), 网关只负责停掉其它占资源的后端 + 转请求。
 
-四个后端互斥: 切换 = 等在途请求结束 -> 停当前后端 -> 起新的 -> 等就绪。
+三个后端互斥: 切换 = 等在途请求结束 -> 停当前后端 -> 起新的 -> 等就绪。
 切换期间到达的请求**同步阻塞等待** (保证客户端一次成功)。就绪超时按组
 分开: 主池/KVMem 用 gateway.ready_timeout (300s), Strata 用
-strata.ready_timeout (900s), FreeToken 用 ftbridge.ready_timeout (600s)。
+strata.ready_timeout (900s)。
 
-后端只绑回环, 不对外, 而且**四个共用同一个内部口** (默认 8080, llama.cpp
+后端只绑回环, 不对外, 而且**三个共用同一个内部口** (默认 8080, llama.cpp
 和 Strata 的原生默认端口) —— 它们本来就互斥, 同一时刻只跑一个, 共用不会
 撞; 这样谁都不用为了接入网关去改自己的端口。
 **对外永远只有 cfg.host:cfg.port 那一个口** (默认 0.0.0.0:18080, 刻意避开
@@ -70,13 +67,12 @@ import config
 POOL = "pool"
 KVMEM = "kvmem"
 STRATA = "strata"
-FREETOKEN = "freetoken"
-GROUPS = (POOL, KVMEM, STRATA, FREETOKEN)
+GROUPS = (POOL, KVMEM, STRATA)
 
 # 组的中文名 (日志/health 用)
-GROUP_CN = {POOL: "主池", KVMEM: "KVMem", STRATA: "Strata", FREETOKEN: "FreeToken"}
-# 只有主池是「多模型进程池」, 另外三组都是单模型进程 (换档位 = 重启进程)
-SINGLE_MODEL_GROUPS = (KVMEM, STRATA, FREETOKEN)
+GROUP_CN = {POOL: "主池", KVMEM: "KVMem", STRATA: "Strata"}
+# 只有主池是「多模型进程池」, 另外两组都是单模型进程 (换档位 = 重启进程)
+SINGLE_MODEL_GROUPS = (KVMEM, STRATA)
 
 # 这些路径**不因为被访问就把模型拉起来**。开着网页版、浏览器里的 PWA
 # service worker 每次上线都要 GET 一下 /sw.js, 网页版自己还会轮询
@@ -149,11 +145,6 @@ def backend_port_of(cfg: Dict[str, Any], group: str) -> int:
     同一时刻只跑一个, 各占一个端口纯属浪费。Strata 用它自己 json 里写的那个
     (见 strata.port_of)。
 
-    **FreeToken 用它自己的 `freetoken.port` (默认 1919, 即 FT 官方默认)**。
-    以前这里把它也塞进 8080, 结果是: 桌面版按它自己的约定去 1919 找引擎,
-    什么都找不到 -> 永远显示「模型没加载, 正在加载中」, 而模型明明在跑。
-    端口是 FreeToken 自己的事, 网关不该改 (README: 它有自己的一套管理办法)。
-
     对外永远只有 `config.host:config.port` 那一个口。
     """
     if group == STRATA:
@@ -162,29 +153,11 @@ def backend_port_of(cfg: Dict[str, Any], group: str) -> int:
             return int(strata.port_of(cfg))
         except Exception:                                # noqa: BLE001
             pass
-    if group == FREETOKEN:
-        import ftbridge
-        try:
-            return int(ftbridge.port_of(cfg))
-        except Exception:                                # noqa: BLE001
-            pass
     gw = (cfg or {}).get("gateway") or {}
     try:
         return int(gw.get("backend_port") or 8080)
     except (TypeError, ValueError):
         return 8080
-
-
-def freetoken_is_ready(port: int, timeout: float = 3.0) -> bool:
-    """这个口上是不是**已经能干活**的 FreeToken engine。
-
-    委托给 `ftbridge.is_ready_at`, 它比「/health 回 200」严格两分:
-    加载中不算就绪, 而且**必须验身份** —— 四个后端共用内部口 8080, 而
-    llama-server 的 /health 就是 `{"status":"ok"}`。只认状态值的话, 切到主池
-    之后会把主池误判成「FreeToken 还在跑」, 状态栏和互斥判定跟着一起错。
-    """
-    import ftbridge
-    return ftbridge.is_ready_at(port, timeout)
 
 
 def preload_of(cfg: Dict[str, Any]) -> bool:
@@ -198,12 +171,10 @@ def group_of(model: Dict[str, Any]) -> str:
         return KVMEM
     if rt == config.STRATA_RUNTIME:
         return STRATA
-    if rt == config.FREETOKEN_RUNTIME:
-        return FREETOKEN
     return POOL
 
 
-# Strata / FreeToken 活跃时网关要**完全让路**: 它们自己的接口原样转发,
+# Strata 活跃时网关要**完全让路**: 它自己的接口原样转发,
 # 一个字节都不改。
 # 之前网关替 Strata 合成了 /props(role 改写成 router)和 /models/sse —— 那是
 # llama.cpp 网页版的口径, Strata 没有这些接口也没有这些语义, 硬塞给它
@@ -215,10 +186,10 @@ def group_of(model: Dict[str, Any]) -> str:
 # 网关在这两条路上只做两件事:
 #   1. 停掉其它占资源的后端 (显存/内存就它一份)
 #   2. 把请求原样转给它
-# /v1/models 例外 —— 那份四组合并的目录是网关自己的「聚合入口」, 用来统一
+# /v1/models 例外 —— 那份三组合并的目录是网关自己的「聚合入口」, 用来统一
 # 选组; 后端自己那份 /v1/models 只报它当前那一个模型 (这是它如实反映
 # 「现在跑的是谁」, 不该被网关的目录盖掉)。其它接口一概不碰。
-PASSTHROUGH_GROUPS = frozenset((STRATA, FREETOKEN))
+PASSTHROUGH_GROUPS = frozenset((STRATA,))
 
 
 def catalog(cfg: Dict[str, Any]) -> List[Dict[str, str]]:
@@ -246,7 +217,7 @@ UPSTREAM_META_KEYS = (
 
 def build_models_payload(cfg: Dict[str, Any],
                          created: Optional[int] = None) -> Dict[str, Any]:
-    """OpenAI 风格的 /v1/models 响应 —— 主池 + KVMem + Strata + FreeToken 四组都在里面。"""
+    """OpenAI 风格的 /v1/models 响应 —— 主池 + KVMem + Strata 三组都在里面。"""
     if created is None:
         try:
             created = int(os.path.getmtime(config.CONFIG_PATH))
@@ -372,13 +343,8 @@ class Backend:
         self.proc: Optional[subprocess.Popen] = None
         self.model_id: Optional[str] = None      # KVMem: 正在跑的档位 id
         self._handles: List[Any] = []
-        # FreeToken 这一组的 engine 不是我们 spawn 的 (是 FreeToken 自己的
-        # daemon 起的, 这样桌面版才看得见), 所以「在跑没」只能去问 daemon。
-        # 这里存一份 cfg 供 running()/stop() 用 —— 它们被调用时拿不到 cfg。
+        # 这一组的配置留一份给 running()/stop() 用 —— 它们被调用时拿不到 cfg。
         self.cfg: Dict[str, Any] = cfg if cfg is not None else {}
-        # daemon 端口探测有缓存: running() 会被状态轮询频繁调用, 而它要走一次
-        # HTTP。缓存 2 秒足够新鲜, 又不会把监控窗口拖成逐请求打 daemon。
-        self._dport_cache: Tuple[float, int, Optional[Dict[str, Any]]] = (0.0, 0, None)
 
     # ---------- 描述 ----------
     @property
@@ -392,9 +358,6 @@ class Backend:
         if self.kind == KVMEM:
             import kvmem
             return kvmem.out_log(), kvmem.err_log()
-        if self.kind == FREETOKEN:
-            import ftbridge
-            return ftbridge.out_log(), ftbridge.err_log()
         import strata
         return strata.out_log(), strata.err_log()
 
@@ -421,37 +384,11 @@ class Backend:
                 + (f" (当前指向 {cfgp}, 文件不存在)" if cfgp else ""))
         return py, strata.build_args(cfg, target), dict(os.environ), strata.install_dir(cfg)
 
-    def _command_freetoken(self, cfg: Dict[str, Any],
-                           model: Optional[Dict[str, Any]]) -> Tuple[str, List[str],
-                                                                     Dict[str, str], str]:
-        """FreeToken 分支: 起它自己 venv 里的 `python -m freetoken.cli serve`。
-
-        和 Strata 一样是「一个 HTTP 服务把参数转交给引擎」, 所以 exe 位放
-        python, 参数是 `ft serve` 的。必须用**它自带 venv** 的 python ——
-        torch / tvm-ffi / flashlib 都装在那儿, 系统 python 一定 import 失败。
-        """
-        import ftbridge
-        py = ftbridge.find_python(cfg)
-        if not py or not os.path.isfile(py):
-            raise BackendError(
-                f"未找到 FreeToken 的 python: {py or '(空)'} —— 它必须用它自带 "
-                f"venv 里的那个, 系统 python 没有 torch")
-        target = model or ftbridge.active_model(cfg) or {}
-        mdir = ftbridge.model_dir_of(target)
-        if not mdir or not os.path.isdir(mdir):
-            raise BackendError(
-                "没有可用的 FreeToken 档位: 请先在「⚡ FreeToken」页登记一个模型"
-                + (f" (当前指向 {mdir}, 目录不存在)" if mdir else ""))
-        return (py, ftbridge.build_args(cfg, target), dict(os.environ),
-                ftbridge.install_dir(cfg))
-
     def _command(self, cfg: Dict[str, Any],
                  model: Optional[Dict[str, Any]]) -> Tuple[str, List[str],
                                                            Dict[str, str], str]:
         if self.kind == STRATA:
             return self._command_strata(cfg, model)
-        if self.kind == FREETOKEN:
-            return self._command_freetoken(cfg, model)
         if self.kind == POOL:
             llama_dir = str(cfg.get("llama_dir") or r"C:\llama.cpp").rstrip("\\/")
             exe = os.path.join(llama_dir, "llama-server.exe")
@@ -494,191 +431,11 @@ class Backend:
 
     # ---------- 生命周期 ----------
     def running(self) -> bool:
-        if self.kind == FREETOKEN:
-            return self._freetoken_running()
         return self.proc is not None and self.proc.poll() is None
-
-    def _freetoken_daemon_cached(
-            self, nonblocking: bool = False) -> Optional[Dict[str, Any]]:
-        """daemon 探测走缓存 —— 它原来每次要 2 次 HTTP, 每次 2s 超时。
-
-        daemon 是本机进程, 起来/挂掉都以「秒」为单位, 1.5s 的缓存看不出差别;
-        而 `/health` 每次 4 秒会把网页版/监控的轮询全拖爆 (实测 UI 直接误报
-        「无法连接」, 而网关其实好好的)。
-        """
-        now = time.monotonic()
-        hit = getattr(self, "_ftd_cache", None)
-        if hit is not None and now - hit[0] < 1.5:
-            return hit[1]
-        if nonblocking:
-            # 不阻塞请求: 起一个后台线程去探, 这次先按「没有 daemon」回答。
-            # 下一轮(>=1.5s 后)缓存就有值了 —— 状态栏晚 1.5 秒变绿完全没关系,
-            # 而让连接线程堵 2 秒是致命的。
-            self._warm_freetoken_daemon()
-            return None
-        got = self._freetoken_daemon()
-        # 时间戳取**探测之后**: daemon 不在时探测本身要 2 秒多, 用探测前的
-        # 时间戳写缓存, 等于写进去就已经过期 —— 缓存形同虚设 (这就是它一直没
-        # 命中的原因)。
-        self._ftd_cache = (time.monotonic(), got)
-        return got
-
-    def _freetoken_daemon(self) -> Optional[Dict[str, Any]]:
-        """找到活着的 FreeToken daemon 的状态; 没有就 None。
-
-        带 2 秒缓存 —— `running()` 会被 /health 轮询和状态条反复调用。
-        """
-        import ftbridge
-        # 缓存里**连 engine 状态一起存**。原来只缓存了 daemon 端口,
-        # 命中时还要再 engine_status() 一次 —— 而它内部又探一遍 daemon,
-        # 于是 /health 每次 4 秒以上, 网页版/监控的轮询被拖爆
-        # (实测 UI 直接误报「无法连接」, 而网关其实好好的)。
-        now = time.time()
-        ts, port, st = self._dport_cache
-        # **daemon 不在也要缓存** —— 原来用 port 非 0 才算命中, 于是
-        # 「确认它没在跑」这个结果永远不被记住, 每次 /health 都要重新探一遍
-        # (2 个候选口 x 1.2s = 2.4s), 网页版/监控的轮询全被拖爆。
-        if now - ts < 2.0:
-            return st
-        port, st = ftbridge.daemon_and_status(self.cfg)
-        # 时间戳同样取探测**之后** (见 _freetoken_daemon_cached 的注释)
-        self._dport_cache = (time.time(), port, st)
-        return st
-        return st
-
-    def _warm_freetoken_daemon(self) -> None:
-        """后台探测 daemon 并填缓存 (最多一个在跑)。"""
-        flag = "_ftd_warming"
-        if getattr(self, flag, False):
-            return
-        object.__setattr__(self, flag, True)
-
-        def _go() -> None:
-            try:
-                got = self._freetoken_daemon()
-                # 时间戳取探测**之后** (见 _freetoken_daemon_cached 的注释)
-                self._ftd_cache = (time.monotonic(), got)
-            except Exception:                        # noqa: BLE001
-                pass
-            finally:
-                object.__setattr__(self, flag, False)
-
-        threading.Thread(target=_go, name="ft-daemon-probe",
-                         daemon=True).start()
-
-    def _freetoken_running(self) -> bool:
-        """FreeToken 这组到底在不在跑, 而且是不是**我们**那个。
-
-        光问 daemon「有没有 engine」是不够的 —— FreeToken 的 daemon 一次只管
-        **一个** engine, 而桌面版是用它自己的默认端口 (1919) 请求的。谁最后
-        请求谁赢: 桌面版里点一下加载, 就可能把我们放在 8080 上的那个顶掉。
-        那时daemon 报 `running: true`, 但**我们这个口上什么都没有** —— 如果
-        就据此认定「FreeToken 在跑」, 网关会以为 8080 被占着 (于是别的组不敢
-        bind), 状态栏也一直显示 freetoken running, 而实际上什么都调不通。
-
-        所以判据是: 引擎在跑 **且** 就在 `self.port` 上。
-        """
-        # **别在请求线程里做 daemon 探测**。它最坏要 2 秒多 (两个候选口各
-        # 1.2s), 而 `/health` 和 `/models` 是网页版每秒轮询好几次的接口 ——
-        # 探测一旦赶不上, 连接线程全堵在这, 于是「端口在听但连接被立刻断开」
-        # (RemoteDisconnected), 监控就报「无法连接」。抓栈抓到过:
-        #   handle_one_request -> health_payload -> running -> find_daemon
-        #     -> urlopen -> send  ← 卡在这
-        # 现在改成: 缓存命中就用; 没命中也**不等**, 立刻返回「暂时不知道」,
-        # 由后台线程去探测并填缓存 (见 _warm_freetoken_daemon)。
-        st = self._freetoken_daemon_cached(nonblocking=True)
-        if st and st.get("running"):
-            try:
-                if int(st.get("port") or 0) == self.port:
-                    return True
-            except (TypeError, ValueError):
-                pass
-            # 引擎在, 但不在我们这个口上 (被桌面版顶到 1919 之类)
-            self._log(f"[{self.name}] daemon 管的 engine 在 "
-                      f"{st.get('port')}, 不是我们要的 {self.port} —— "
-                      f"按「没在跑」处理")
-            return False
-        return _port_owner_pids(self.port) != [] and \
-            freetoken_is_ready(self.port)
-
-    def _start_freetoken(self, cfg: Dict[str, Any],
-                         model: Optional[Dict[str, Any]]) -> None:
-        """经 FreeToken 自己的 daemon 启动 engine。
-
-        不自己 spawn 是有意的: 桌面版只认它那个 daemon, 网关自己起的 engine
-        对它**完全不存在** (实测 daemon `/engine/status` 一直是
-        `running:false`, 运行期也不会 `adopted`) —— 那样用户在软件里看不到
-        任何调用, 而「在软件里看得见」正是接它的理由。
-
-        跑着**别的**模型时必须走 `/engine/switch`: 让 daemon 内部做
-        「停旧 → 起新」(封账、等在途请求、超时强杀), 这些收尾活儿自己写要出
-        一堆边界情况。
-        """
-        import ftbridge
-        target = model or ftbridge.active_model(cfg) or {}
-        mdir = ftbridge.model_dir_of(target)
-        if not mdir or not os.path.isdir(mdir):
-            raise BackendError(
-                "没有可用的 FreeToken 档位: 请先在「⚡ FreeToken」页登记一个模型"
-                + (f" (当前指向 {mdir}, 目录不存在)" if mdir else ""))
-        st = self._freetoken_daemon()
-        # 判据是「它现在是不是已经是我们要的那个」—— 模型 + 端口都对, 才轮得到
-        # start。**跑着但端口不是我们的 (哪怕模型相同) 也得走 switch**: FreeToken
-        # 一次只管一个 engine, 桌面版用 1919 请求就会占着槽位, 这时 start 要么
-        # 被拒要么起在别处, 而我们要的是它落在 8080 上。
-        want_port = self.port
-        have_model = str((st or {}).get("model") or "")
-        try:
-            have_port = int((st or {}).get("port") or 0)
-        except (TypeError, ValueError):
-            have_port = 0
-        already_ours = bool(st and st.get("running")
-                            and have_port == want_port
-                            and have_model == mdir)
-        if already_ours:
-            self._log(f"[{self.name}] daemon 管的 engine 已经是这个了 "
-                      f"(端口 {want_port}), 不用重起")
-            self.model_id = str(target.get("id") or "") or None
-            self._dport_cache = (0.0, 0, None)
-            return
-        if st and st.get("running"):
-            why = ("端口 %s -> %s" % (have_port, want_port) if have_model == mdir
-                   else "模型 %s -> %s" % (os.path.basename(have_model),
-                                          os.path.basename(mdir)))
-            self._log(f"[{self.name}] 让 daemon 切过去 ({why}) —— "
-                      f"它一次只管一个 engine")
-            ok, msg = ftbridge.engine_switch(cfg, target)
-        else:
-            ok, msg = ftbridge.engine_start(cfg, target)
-        if ok:
-            self._log(f"[{self.name}] {msg}")
-            self.model_id = str(target.get("id") or "") or None
-            self._dport_cache = (0.0, 0, None)
-            return
-        # daemon 这条路走不通 —— 宁可退回自己 spawn, 也不能让请求直接失败。
-        # 代价是**桌面版看不见这次调用** (它只认自己 daemon 管的 engine), 所以
-        # 这里要说清楚, 别让人以为「软件里应该会出现」而白等。
-        self._log(f"[{self.name}] ⚠ 经 daemon 启动失败 ({msg}); "
-                  f"退回自己拉起进程 —— **FreeToken 桌面版将看不到这次调用** "
-                  f"(它只认自己 daemon 管的 engine)")
-        exe, args, env, cwd = self._command_freetoken(cfg, target)
-        out_p, err_p = self.log_paths()
-        os.makedirs(os.path.dirname(out_p), exist_ok=True)
-        fo = open(out_p, "a", encoding="utf-8", errors="replace")
-        fe = open(err_p, "a", encoding="utf-8", errors="replace")
-        self._handles = [fo, fe]
-        self._log(f"[{self.name}] 启动 {exe} {' '.join(args)}")
-        self.proc = subprocess.Popen(
-            [exe] + args, cwd=cwd, env=env, stdout=fo, stderr=fe,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-        self.model_id = str(target.get("id") or "") or None
 
     def start(self, cfg: Dict[str, Any],
               model: Optional[Dict[str, Any]] = None) -> None:
         self.cfg = cfg
-        if self.kind == FREETOKEN:
-            self._start_freetoken(cfg, model)
-            return
         exe, args, env, cwd = self._command(cfg, model)
         out_p, err_p = self.log_paths()
         os.makedirs(os.path.dirname(out_p), exist_ok=True)
@@ -698,8 +455,6 @@ class Backend:
             try:
                 if self.kind == KVMEM:
                     mod = kvmem
-                elif self.kind == FREETOKEN:
-                    import ftbridge as mod
                 else:
                     import strata as mod
                 self.model_id = str((mod.active_model(cfg) or {}).get("id") or "") or None
@@ -708,9 +463,6 @@ class Backend:
 
     def stop(self, timeout: float = 20.0) -> None:
         self.model_id = None
-        if self.kind == FREETOKEN:
-            self._stop_freetoken(timeout)
-            return
         proc = self.proc
         self.proc = None
         if proc is not None and proc.poll() is None:
@@ -749,91 +501,9 @@ class Backend:
         while time.time() < deadline and port_busy(self.port):
             time.sleep(0.3)
 
-    def _stop_freetoken(self, timeout: float = 20.0) -> None:
-        """经 daemon 停 engine。
-
-        优先走 `/engine/stop` —— daemon 会封账、等在途请求收尾、超时再强杀,
-        比我们自己 taskkill 干净 (它知道 accounting 这回事, 强杀会丢 token 尾巴)。
-        daemon 不在 (桌面版关了、也没自启成功) 或者拒绝响应时, 退回按端口占用者
-        PID 收 —— 那一组也不该占着显存。
-        """
-        import ftbridge
-        st = self._freetoken_daemon()
-        if st is not None:
-            other = None
-            try:
-                other = int((st or {}).get("port") or 0) or None
-            except (TypeError, ValueError):
-                other = None
-            if not (st or {}).get("running"):
-                self._log(f"[{self.name}] 引擎本来就没在跑, 不用停")
-            elif other and other != self.port:
-                # daemon 一次只管一个 engine, 所以「停 FreeToken」会连带把桌面端
-                # 自己起的那个也停掉。这在 16GB 卡上是**必须的** (显存就一份,
-                # 不腾出来下一组加载不了), 但要说清楚, 别让人以为路由在乱杀。
-                self._log(f"[{self.name}] 引擎在 {other} 上 (不是网关的 "
-                          f"{self.port}, 很可能是桌面端自己加载的) —— "
-                          f"一并停掉, 否则显存腾不出来给下一组")
-            ok, msg = ftbridge.engine_stop(self.cfg)
-            self._log(f"[{self.name}] {msg if ok else '停 engine: ' + msg}")
-            self._dport_cache = (0.0, 0, None)
-        else:
-            self._log(f"[{self.name}] 没有 daemon 在管它, 直接按端口收进程")
-        deadline = time.time() + max(1.0, float(timeout))
-        while time.time() < deadline:
-            if not port_busy(self.port):
-                return
-            time.sleep(0.3)
-        # daemon 说停了但端口还占着 (或者压根没 daemon): 按端口占用者 PID 收。
-        # **绝不**按 python.exe 镜像名杀 —— 那会把桌面版和网关自己一起送走。
-        for pid in _port_owner_pids(self.port):
-            try:
-                subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)],
-                               capture_output=True, timeout=20)
-            except Exception:                            # noqa: BLE001
-                pass
-        deadline = time.time() + 10
-        while time.time() < deadline and port_busy(self.port):
-            time.sleep(0.3)
-        _sweep_orphan_spawn_workers(self.port)
-
     def _health_says_ready(self, code: int, body: bytes) -> bool:
-        """/health 200 是不是等于「能干活了」。
-
-        别家后端 200 就是好了。但 **FreeToken 的 /health 在加载期间也回
-        200** (`{"status": "loading", "phase": ..., "progress": ...}`) ——
-        那是它给桌面版看进度的。于是「200 就当就绪」会让网关在权重还没搬进
-        显存时就把请求转过去, 客户端拿到 503 "model is still loading"。
-        它只有 `status == "ok"` 才算好 (见 ftbridge.is_ready)。
-
-        `status == "error"` 直接判不就绪并说明原因 —— 那是要等人管的
-        (配置错/OOM), 干等到超时只会让人更迷惑。
-        """
-        if code != 200:
-            return False
-        if self.kind != FREETOKEN:
-            return True
-        import ftbridge
-        try:
-            obj = json.loads((body or b"").decode("utf-8", "replace"))
-        except Exception:                                # noqa: BLE001
-            return True                                 # 读不懂就别拦, 沿用旧行为
-        if not isinstance(obj, dict):
-            return True
-        # 身份校验: 共用内部口之后, 这个口上可能是**别的**后端 —— 而
-        # llama-server 的 /health 也回 {"status":"ok"}。不验身份会把主池
-        # 误判成 FreeToken 就绪, 于是请求被转给一个不做 OpenAI 的服务。
-        if not ftbridge._looks_like_freetoken(obj):
-            self._log(f"[{self.name}] {self.port} 上不是 FreeToken "
-                      f"(/health 长得不像), 不当成就绪")
-            return False
-        st = str(obj.get("status") or "").lower()
-        if st == "ok":
-            return True
-        if st == "error":
-            raise BackendError(
-                f"[{self.name}] 后端启动失败: {obj.get('message') or '未说明原因'}")
-        return False
+        """/health 200 是不是等于「能干活了」。"""
+        return code == 200
 
     def wait_ready(self, timeout: float) -> None:
         """阻塞到 /health 明确说「好了」(见 _health_says_ready)。"""
@@ -849,36 +519,9 @@ class Backend:
                     + "\n".join(tail))
             code, body = http_get(url, timeout=5.0)
             if self._health_says_ready(code, body):
-                if self.kind == FREETOKEN:
-                            self._log(f"[{self.name}] 就绪 (127.0.0.1:{self.port})")
+                self._log(f"[{self.name}] 就绪 (127.0.0.1:{self.port})")
                 return
-            # FreeToken 一次只管**一个** engine, 而桌面版是用它自己的默认端口
-            # (1919) 请求的 —— 谁最后请求谁赢。所以我们请求了 8080, 桌面版又点
-            # 一下加载, 我们这个就被顶掉了: 这时 daemon 报 running 但端口不是
-            # 我们的, 继续在这里轮询到超时毫无意义, 早点说清楚。
-            if self.kind == FREETOKEN:
-                import ftbridge
-                other = ftbridge.engine_on_port(self.cfg)
-                if other and other != self.port:
-                    raise BackendError(
-                        f"[{self.name}] 我们要它跑在 127.0.0.1:{self.port}, "
-                        f"但 daemon 管的 engine 被放到 {other} 上了 "
-                        f"(FreeToken 一次只管一个 engine, 桌面版用 1919 "
-                        f"请求就会把我们的顶掉)。\n"
-                        f"  两个办法: 在 FreeToken 桌面版里把当前 engine 停掉, "
-                        f"或者用请求重新指定这个模型把它切回 {self.port}。")
-            # FreeToken 加载期间 200 也在, 所以要报状态而不是状态码 ——
-            # 「等待就绪中 (200)」看着像自相矛盾
             note = str(code)
-            if code == 200 and self.kind == FREETOKEN:
-                try:
-                    obj = json.loads((body or b"").decode("utf-8", "replace"))
-                    note = str((obj or {}).get("status") or "loading")
-                    ph = (obj or {}).get("phase")
-                    if ph:
-                        note += f"/{ph}"
-                except Exception:                        # noqa: BLE001
-                    pass
             if note != last:
                 last = note
                 self._log(f"[{self.name}] 等待就绪中 (/health -> {note})")
@@ -1098,9 +741,6 @@ class GatewayState:
                 elif group == STRATA:
                     model_entry = self._strata_entry(cfg, model_id)
                     target = str(model_entry.get("id") or model_id or "")
-                elif group == FREETOKEN:
-                    model_entry = self._freetoken_entry(cfg, model_id)
-                    target = str(model_entry.get("id") or model_id or "")
                 self._log(f"[网关] 切换到 {b.name}"
                           + (f" / {target}" if target else ""))
                 # 内部口被**外部进程**占着(桌面端自己加载的模型 / 上轮残留)
@@ -1152,8 +792,7 @@ class GatewayState:
         """切到某组时等它就绪的秒数。
 
         Strata 要把 35-55GB 拉到内存, 1-3 分钟起步, 拿主池那 300s 去卡它
-        会误判成「起不来」—— 所以它有自己更大的超时。FreeToken 同样要
-        把权重搬进显存, 也不该拿主池那 300s 去卡。
+        会误判成「起不来」—— 所以它有自己更大的超时。
         """
         gw = cfg.get("gateway") or {}
         if group == STRATA:
@@ -1162,12 +801,6 @@ class GatewayState:
                 return float(st.get("ready_timeout", 900) or 900)
             except (TypeError, ValueError):
                 return 900.0
-        if group == FREETOKEN:
-            ft = cfg.get("freetoken") or {}
-            try:
-                return float(ft.get("ready_timeout", 600) or 600)
-            except (TypeError, ValueError):
-                return 600.0
         try:
             return float(gw.get("ready_timeout", 300) or 300)
         except (TypeError, ValueError):
@@ -1187,23 +820,6 @@ class GatewayState:
         if not entry:
             raise BackendError(
                 "没有 Strata 档位: 请先在「🌐 Strata」页登记一个 strata-*.json")
-        return entry
-
-    def _freetoken_entry(self, cfg: Dict[str, Any],
-                         model_id: Optional[str]) -> Dict[str, Any]:
-        import ftbridge
-        for m in cfg.get("models", []) or []:
-            if group_of(m) != FREETOKEN:
-                continue
-            if model_id and str(m.get("id") or "") == model_id:
-                return m
-        if model_id:
-            raise BackendError(f"FreeToken 档位不存在: {model_id}")
-        entry = ftbridge.active_model(cfg)
-        if not entry:
-            raise BackendError(
-                f"没有 FreeToken 档位: 请先在「⚡ FreeToken」页从 "
-                f"{ftbridge.models_dir(cfg)} 里登记一个模型")
         return entry
 
     def _persist_serve_mode(self, group: str) -> None:
@@ -1279,9 +895,6 @@ class GatewayApp:
                 POOL: Backend(POOL, shared, self.log),
                 KVMEM: Backend(KVMEM, backend_port_of(cfg, KVMEM), self.log),
                 STRATA: Backend(STRATA, backend_port_of(cfg, STRATA), self.log),
-                FREETOKEN: Backend(FREETOKEN,
-                                   backend_port_of(cfg, FREETOKEN), self.log,
-                                   cfg),
             }
         self.backends = backends
         self.state = GatewayState(self.cfg_loader, self.backends, self.log)
@@ -1400,11 +1013,6 @@ class GatewayApp:
         if group == STRATA:
             self._merge_strata_status(payload, b, cfg)
             return payload
-        if group == FREETOKEN:
-            self._merge_freetoken_status(payload, b)
-            self._merge_upstream_meta(payload, b)
-            self._cap_context_to_kv(payload, b, cfg)
-            return payload
         try:
             code, body = http_get(f"http://127.0.0.1:{b.port}/v1/models", timeout=3.0)
             if code != 200:
@@ -1430,61 +1038,6 @@ class GatewayApp:
             return {}
         return {str(n.get("id")): n
                 for n in (obj.get("data") or []) if isinstance(n, dict)}
-
-    def _merge_upstream_meta(self, payload: Dict[str, Any],
-                             b: "Backend") -> None:
-        """把上游 `/v1/models` 的元数据合进来。
-
-        **必须透传**: 客户端 (Hermes 等) 就是靠 `max_model_len` /
-        `context_length` 决定发多长。合成条目里只有 id/aliases/tags, 客户端拿
-        不到这两个字段就只能瞎猜 —— 之前 Hermes 就因为拿不到而一直按 8196 发。
-        """
-        upstream = self._upstream_index(b.port, "/v1/models")
-        for node in payload["data"]:
-            src = upstream.get(node["id"])
-            if not src:
-                continue
-            if src.get("owned_by"):
-                node["owned_by"] = src["owned_by"]
-            for key in UPSTREAM_META_KEYS:
-                if key in src:
-                    node[key] = src[key]
-
-    def _cap_context_to_kv(self, payload: Dict[str, Any],
-                           b: "Backend",
-                           cfg: Optional[Dict[str, Any]] = None) -> None:
-        """把 FreeToken 的上下文上限报给客户端。
-
-        语义:
-          * `freetoken.kv_target` > 0  -> 就报它。这是**用户设定的上限**,
-            我们信任它。FT 的实际 KV 由用户在 FT 面板里管, 网关不读、不算、
-            不改。万一两者不一致 (比如引擎刚重启、FT 回到自己的默认值),
-            FT 会**明确 400** 拒绝超长请求
-            ("prompt is too long: X tokens > N maximum"), 不会静默截断 ——
-            报错比"报一个保守的小数字、让 agent 永远不敢发长请求"更好用。
-          * 没配 (0)  -> 退而报引擎实际能吃下的 (只读 /v1/stats)。
-
-        **全程只读**: 不查也不改 FT 的任何状态, 更不替它分配显存。
-        """
-        want = int(((cfg or {}).get("freetoken") or {}).get("kv_target") or 0)
-        cap = want
-        if not cap:
-            try:
-                import ftbridge
-                cap = ftbridge.kv_capacity(b.port, timeout=2.0)
-            except Exception:
-                cap = 0
-        if not cap:
-            return
-        for node in payload["data"]:
-            if node.get("tags") != [FREETOKEN]:
-                continue
-            for key in ("max_model_len", "context_length"):
-                cur = node.get(key)
-                # FreeToken 的 /v1/models **不带**这两个字段, 光靠"压低"永远
-                # 压不到东西 —— 客户端 (Hermes) 拿不到就只能自己瞎猜发多长。
-                if not isinstance(cur, int) or cur <= 0 or cur > cap:
-                    node[key] = cap
 
     def _merge_strata_status(self, payload: Dict[str, Any],
                              b: "Backend",
@@ -1518,23 +1071,6 @@ class GatewayApp:
             on = value == "loaded" and bool(active_id) and mid == active_id
             node["status"] = {"value": "loaded" if on else "unloaded",
                               "args": []}
-
-    def _merge_freetoken_status(self, payload: Dict[str, Any],
-                                b: "Backend") -> None:
-        """FreeToken 的 /v1/models 只报「当前这个模型」, 不带 loaded 状态。
-
-        它的 /health 反而给全了: status=ok|loading|error, 还有 phase/progress。
-        用它来判断「在显存里没有」, 免得前端把明明加载好的模型判成不可用。
-        loading 不算 loaded —— 那正是 Web UI 里那种转圈状态该做的事。
-        """
-        obj = self._upstream(b.port, "/health")
-        if not isinstance(obj, dict) or "__code__" in obj:
-            return
-        st = str(obj.get("status") or "").lower()
-        value = "loaded" if st == "ok" else "unloaded"
-        for node in payload["data"]:
-            if node.get("tags") == [FREETOKEN]:
-                node["status"] = {"value": value, "args": []}
 
     def model_payload(self, name: str) -> Optional[Dict[str, Any]]:
         """单个模型 (Web UI 会按 id 单查一条)。
@@ -1663,11 +1199,11 @@ class GatewayHandler(BaseHTTPRequestHandler):
             # 目录答 —— 两组模型都列得出来。
             if path == "/models" and self.command == "GET":
                 return self._send_catalog_cached()
-            # Strata / FreeToken 活跃: 它们自己的接口原样转发, 网关不合成、
-            # 不改写。 (它们没有的接口就让它们的 404 说话, 别替它们编一个)
+            # Strata 活跃: 它自己的接口原样转发, 网关不合成、
+            # 不改写。 (它没有的接口就让它的 404 说话, 别替它编一个)
             if self.app.state.active in PASSTHROUGH_GROUPS:
                 if path == "/models/sse":
-                    # FreeToken / Strata 不是 llama-server, **没有 /models/sse**,
+                    # Strata 不是 llama-server, **没有 /models/sse**,
                     # 实测恒 404。而浏览器的 EventSource 碰到 404 会当成
                     # 「流挂了」立刻重连 -> 每 2 秒一次的死循环 (实测 0.5 次/秒),
                     # 把引擎访问日志刷成 `GET /models/sse 404`, 每行还带个不同的
@@ -1681,7 +1217,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
                         return self._send_raw(code, ctype, raw)
                     return self._send_no_content()
                 # /props 是**例外**, 不能透传 404:
-                #   1) 这两个后端不是 llama-server, 压根没有 /props (实测 FreeToken
+                #   1) 这个后端不是 llama-server, 压根没有 /props (实测 Strata
                 #      的 /props 和 /models/sse 都回 404)
                 #   2) 网页版把 `/props?model=...&autoload=false` 当成「服务起没起」
                 #      的探针, 拿到 404 就显示「服务未启动」, 然后**每秒几十次**地
@@ -1692,13 +1228,19 @@ class GatewayHandler(BaseHTTPRequestHandler):
             if path == "/props" and self.command in ("GET", "POST"):
                 return self._handle_props(path)
             # Hermes 这类客户端还会探 /v1/props 和 Ollama 风格的 /api/tags。
-            # FT 引擎自己**没有**这两个端点 (实测直接 404), 所以日志里会出现
+            # Strata 自己**没有**这两个端点 (实测直接 404), 所以日志里会出现
             # 一串 404 探测。它们不是错误, 但客户端可能因为拿不到而一直等 ——
             # 聚合层本来就要把后端差异吃掉, 这里用 /v1/models 的数据合成一份。
             if path == "/v1/props" and self.command == "GET":
                 return self._handle_props(path)
             if path == "/api/tags" and self.command == "GET":
                 return self._handle_api_tags()
+            # /status: 监控窗口要显示「当前在 prefill 还是生成、第几个 token、
+            # 多少 tok/s」。Strata 有 /status, llama-server(KVMem/主池)没有。
+            # 网关统一答: 后端有就透传, 没有就按 health + 在途请求合成一份,
+            # 保证监控那边永远拿得到结构一致的字段。
+            if path == "/status" and self.command == "GET":
+                return self._handle_status()
             if path == "/models/sse" and self.command == "GET":
                 return self._handle_models_sse()
             self._proxy(path)
@@ -1847,7 +1389,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
             conn.close()
 
     def _handle_props_passthrough(self, path: str) -> None:
-        """活跃组是 Strata / FreeToken 时的 `/props`。
+        """活跃组是 Strata 时的 `/props`。
 
         分两种情况, **别弄混**:
 
@@ -1855,7 +1397,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
           注入**。这是 §23 修过的坑: 注入 `role=router` 会让浏览器里开着的
           llama.cpp 网页版以为后面真有个 router, 于是去轮询 /tools、/build.json
           这些只有 llama-server 才有的接口 -> 全部 404 -> 网页版报错。
-        - 上游答不上 (FreeToken 不是 llama-server, /props 恒 404) -> 自己合成一份
+        - 上游答不上 (Strata 不是 llama-server, /props 恒 404) -> 自己合成一份
           带 role=router 的。**404 绝不能外泄**: 网页版拿
           `/props?model=...&autoload=false` 当「服务起没起」的探针, 404 会被判成
           「服务未启动」, 然后每秒几十次地重试 (实测一分钟几千条)。
@@ -1876,10 +1418,57 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 pass
         return self._send_json(200, self.app.fallback_props())
 
+    def _handle_status(self) -> None:
+        """`GET /status` —— 给监控窗口的实时进度。
+
+        Strata 自己有 `/status` (state/phase/prompt_tokens/generated/tok_s...),
+        直接透传。KVMem / 主池是 llama-server, **没有** `/status`, 透传会 404;
+        这里按 health + 当前模型合成一份字段齐全的空壳, 让监控永远拿得到同一套
+        字段, 不用为每个后端写分支。
+        """
+        group = self.app.state.active
+        try:
+            code, raw, _ct = self._fetch_from_backend(group, None)
+        except Exception:
+            code, raw = 0, b""
+        if code == 200 and raw:
+            try:
+                data = json.loads(raw.decode("utf-8"))
+                data.setdefault("backend", group)
+                return self._send_json(200, data)
+            except Exception:
+                pass
+        # 后端没有 /status: 合成一份, 字段名和 Strata 对齐。
+        health = self.app.health_payload()
+        model = None
+        try:
+            for n in (self.app.models_payload().get("data") or []):
+                if str(n.get("id")):
+                    model = str(n.get("id"))
+                    break
+        except Exception:
+            pass
+        loaded = str(health.get("status", "")) == "ok"
+        self._send_json(200, {
+            "backend": group,
+            "state": "idle" if loaded else "unloaded",
+            "queued": 0,
+            "phase": None,
+            "model": model,
+            "prompt_tokens": None,
+            "prompt_total": None,
+            "generated": None,
+            "max_tokens": None,
+            "elapsed_s": None,
+            "tok_s": None,
+            "tok_s_mean": None,
+            "prefill_tok_s_mean": None,
+        })
+
     def _handle_api_tags(self) -> None:
         """`GET /api/tags` —— Ollama 风格的模型列表。
 
-        FreeToken 引擎没有这个端点 (直接 404), 但 Hermes 这类客户端会拿它
+        Strata 没有这个端点 (直接 404), 但 Hermes 这类客户端会拿它
         当**兼容性探测**: 探不到就可能一直等。聚合层的职责就是把后端差异在
         这里吃掉, 所以用同一份 /v1/models 数据合成 Ollama 的 schema。
         """
@@ -2238,15 +1827,10 @@ def _proc_cmdline(pid: int) -> str:
 # 认得出来的后端 (只按命令行里的可执行文件/脚本判断, 绝不按 python.exe 这种
 # 通用名去杀 —— 那会把网关自己和桌面版一起送走)
 #
-# FreeToken 特别注意: 它每个 serve 是**两个** python 进程 —— venv 的
-# python.exe 只是壳, 真正执行的是 uv 管的 cpython-3.12。所以必须认
-# `freetoken.cli serve` 这个命令行标记, 光认 `python.exe` 是不行的 (那是
-# 通用名, 不能拿来杀), 而光认 venv 那个壳路径又会漏掉真正占着端口的那个。
 # 只有「通用名 / 我们自己起的名字」写死; 各软件的**真实可执行路径一律现取**
 # (见 backend_marks), 这样升级换目录、或新增一个模型/软件都能自动跟上。
 _STATIC_MARKS = ("llama-server.exe", "llama-kvmem-server.exe",
-                 r"serve\server.py", "serve/server.py",
-                 "freetoken.cli serve", r"freetoken.cli", "ft.exe")
+                 r"serve\server.py", "serve/server.py")
 
 # 进程特征缓存 (动态那部分)。设一次 cwd 变了不用反复问磁盘。
 _marks_cache: Dict[str, Tuple[float, Tuple[str, ...]]] = {}
@@ -2268,20 +1852,18 @@ _COMMON_DIR_WORDS = frozenset((
 def backend_marks(cfg: Dict[str, Any]) -> Tuple[str, ...]:
     """**动态**的进程识别特征表: 静态名 + 各软件自报的安装路径。
 
-    为什么不能写死: 之前 `_KNOWN_BACKEND_MARKS` 里 `strata.exe` /
-    `freetoken.cli` 是硬编码字符串。一旦 Strata 换安装目录、FreeToken 换
-    python 版本, 或者新注册一个跑在别的路径上的后端, 认不出来就只会打一句
-    「不像我们认识的后端, 不自动杀」—— 那个残留进程会把内部口占着,
-    后面每个请求都起不来。
+    为什么不能写死: 之前 `_KNOWN_BACKEND_MARKS` 里 `strata.exe` 是硬编码
+    字符串。一旦 Strata 换安装目录、或者新注册一个跑在别的路径上的后端,
+    认不出来就只会打一句「不像我们认识的后端, 不自动杀」—— 那个残留进程会把
+    内部口占着, 后面每个请求都起不来。
 
-    现在改成问各软件自己要路径 (install_dir / find_python / desktop_exe …),
+    现在改成问各软件自己要路径 (install_dir / find_python / …),
     拼成**完整 exe 路径**和**软件目录**两种形态去匹配命令行。
 
     两条硬规矩 (踩过的坑):
       1. **绝不收通用名** (`python.exe` / `pythonw.exe` / `node.exe` …)。
-         网关自己和 FreeToken 的 venv 壳进程都叫 python.exe, 拿它当特征
-         会让清理逻辑把**自己**也杀掉。
-      2. 目录片段只取**软件自己的那一层** (`...\\FreeToken\\venv\\Scripts`),
+         网关自己都叫 python.exe, 拿它当特征会让清理逻辑把**自己**也杀掉。
+      2. 目录片段只取**软件自己的那一层** (`C:\\Strata`),
          不取 `C:\\Users\\xxx\\AppData\\Local` 这种公共上级 —— 那能匹配上
          半个系统上的进程。
     """
@@ -2331,22 +1913,6 @@ def backend_marks(cfg: Dict[str, Any]) -> Tuple[str, ...]:
         _add_exe(os.path.join(str(strata.install_dir(cfg)),
                               "engine", "strata.exe"))
         _add_exe(strata.find_server(cfg))
-    except Exception:                                    # noqa: BLE001
-        pass
-    try:
-        import ftbridge as _ft
-        for fn, depth in (("install_dir", 2), ("find_python", 1),
-                          ("desktop_exe", 1), ("find_ft_exe", 1)):
-            f = getattr(_ft, fn, None)
-            if not callable(f):
-                continue
-            try:
-                v = f(cfg)
-            except Exception:                            # noqa: BLE001
-                continue
-            _add_exe(v)
-            _add_dir(os.path.dirname(str(v)) if fn.endswith("exe")
-                     else v, depth=depth)
     except Exception:                                    # noqa: BLE001
         pass
 
@@ -2499,58 +2065,6 @@ def _free_stale_backends(app: GatewayApp) -> None:
     连网关自己和桌面版一起送走)。认不出来的占用者一律不动, 只说明情况。
     """
     _free_shared_port(app)
-
-
-def _sweep_orphan_spawn_workers(port: int) -> None:
-    """清掉 FreeToken 引擎留下的 `multiprocessing.spawn` 孤儿。
-
-    **为什么需要**: FreeToken 引擎会 spawn 出 CUDA 工作子进程, 这些子进程继承
-    显存上下文, 但父进程被强杀时**不会跟着走** —— 父没了、子还活着, 显存一直
-    占着。实测抓到两个: 父进程 10436 (今天 11:44 被杀) 早就没了, 子进程 24468 /
-    60532 却还在跑, 其中 24468 一个人吃掉 17.5GB 内存、48 个线程。
-
-    后果很直接: **FreeToken 桌面端从此起不来模型** —— 引擎日志里
-    `Free memory after initialization: 0.00 GiB` / `avail_mem = 0.00 GiB`,
-    显存被孤儿吃得一点不剩。用户会以为是「被改了配置」, 其实只是上次没清干净。
-
-    判定必须**三条同时成立**才动手, 否则会误伤别人的 Python 进程:
-      1) 命令行含 `multiprocessing.spawn` (torch/DataLoader 那种工作进程)
-      2) **父进程已经不存在** (真孤儿)
-      3) 它或它的父进程在监听我们要清的那个引擎口 —— 或者它根本已经不监听
-         (孤儿最爱干的事: 端口没了, 显存还占着)
-    """
-    try:
-        import psutil
-    except Exception:                                    # noqa: BLE001
-        return
-    try:
-        mine = set(_port_owner_pids(port))
-    except Exception:                                    # noqa: BLE001
-        mine = set()
-    swept = []
-    for pr in psutil.process_iter(["pid", "ppid", "cmdline", "name"]):
-        try:
-            cmd = " ".join(pr.info.get("cmdline") or [])
-            if "multiprocessing.spawn" not in cmd:
-                continue
-            ppid = pr.info.get("ppid") or 0
-            if ppid and psutil.pid_exists(ppid):
-                continue                     # 父还在 -> 不是孤儿, 引擎还活着
-            if pr.info["pid"] in mine:
-                continue                     # 正经守着引擎口的那个
-            swept.append(pr.info["pid"])
-        except Exception:                                # noqa: BLE001
-            continue
-    for pid in swept:
-        try:
-            subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)],
-                           capture_output=True, timeout=20)
-        except Exception:                                # noqa: BLE001
-            pass
-    if swept:
-        sys.stderr.write("%s [网关] 清掉 FreeToken 遗留的 spawn 孤儿进程 %s\n"
-                         % (time.strftime("%Y-%m-%d %H:%M:%S"), swept))
-        sys.stderr.flush()
 
 
 def _guard_active_fn(app: GatewayApp) -> Callable[[], bool]:

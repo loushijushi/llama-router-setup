@@ -58,16 +58,5 @@
             "enabled": true,
             "params": {}
         }
-    ],
-    "freetoken": {
-        "_comment": "FreeToken 分支 (freetoken 包, 自带 OpenAI + Anthropic 兼容的 ft serve): 模型是**目录**, 参数是它自己的 flag, 不吃 llama flag。install_dir 留空 -> 在 %LOCALAPPDATA% 和注册表 ProfileList 里探测 (服务是 LocalSystem 跑, 装在某个用户的 profile 下, 必须这么找); 探测到之后 UI 会把它落盘到这里。ready_timeout=冷加载把权重搬进显存要多久。extra_args=兜底附加参数(空格分隔, 原样拆成 argv), 档位条目自己的 freetoken_args 优先",
-        "enabled": true,
-        "install_dir": "",
-        "models_dir": "D:\\AI\\freetoken\\models",
-        "python": "",
-        "desktop_exe": "",
-        "active_id": "",
-        "ready_timeout": 600,
-        "extra_args": ""
-    }
+    ]
 }

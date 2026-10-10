@@ -451,12 +451,8 @@ SCHEMA_INDEX: Dict[str, Dict[str, Any]] = {p["key"]: p for p in PARAM_SCHEMA}
 # "kvmem" = 走 llama-kvmem-server 分支, 只由「⚡ KVMem」页托管。
 # "strata" = 走 Strata 分支 (C:\Strata, 自带 OpenAI 兼容服务),
 # 只由「🌐 Strata」页托管; 它的参数全在 strata-<档位>.json 里, 不吃 llama flag。
-# "freetoken" = 走 FreeToken 分支 (freetoken pip 包, 自带 OpenAI + Anthropic
-# 兼容服务 `ft serve`), 只由「⚡ FreeToken」页托管; 模型是**目录**, 参数是
-# FreeToken 自己的 flag, 同样不吃 llama flag。
 KVMEM_RUNTIME = "kvmem"
 STRATA_RUNTIME = "strata"
-FREETOKEN_RUNTIME = "freetoken"
 
 KVMEM_SCOPED_KEYS = frozenset(p["key"] for p in PARAM_SCHEMA if p["scope"] == "kvmem")
 
@@ -730,63 +726,6 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "gpu": "",
         "api_key": "",         # 留空 = 后端不鉴权 (它只绑回环, 对外靠网关)
     },
-    # FreeToken 分支 (freetoken pip 包, 自带 OpenAI + Anthropic 兼容的
-    # `ft serve`): 模型是**目录**, 引擎参数是 FreeToken 自己的 flag
-    # (模型条目的 freetoken_args), 不吃 llama flag。
-    "freetoken": {
-        "enabled": True,
-        "install_dir": "",     # 留空 -> %LOCALAPPDATA%\FreeToken
-        "models_dir": r"D:\AI\freetoken\models",
-        "python": "",          # 留空 -> 自动用 <install_dir>\venv\Scripts\python.exe
-        "desktop_exe": "",     # 留空 -> 自动找 "FreeToken Desktop\freetoken-desktop.exe"
-        "active_id": "",
-        # 从零加载要把权重搬进显存, 冷启动可能好几分钟
-        "ready_timeout": 600,
-        # 下面三个**默认都不动 FreeToken 的显存分配**。
-        #
-        # 原则: FreeToken 的参数归 FreeToken 桌面版管, 网关不越权改。引擎的
-        # KV / MoE 分配是 FreeToken 自己按显存预算策略算出来的, 你在它界面里
-        # 怎么设就怎么跑。
-        #
-        # 网关**曾经**在引擎就绪后自动调 POST /v1/cache/rebuild 把 KV 顶大
-        # (因为启动时只自动给一点点 KV, 实测 8196 页 = 8196 token, 剩下的预算
-        # 全给了 MoE 专家缓存, 长对话会被**整条丢掉**:
-        #   WARNING Input sequence length 49016 exceeds 8196, request 0 is dropped.)
-        # 但那是**越权**: 顶满 KV 会把 MoE 专家缓存挤掉, 实测专家缓存从 4681
-        # 掉到 1430, **解码速度直接腰斩** (nvidia-smi 只剩 ~1.3GB 余量)。
-        # 所以网关**不碰** FreeToken 的缓存池 —— 它有自己的一套弹性内存管理
-        # (专家缓存与 KV 之间运行时重分配)。网关只读 /v1/cache/status 展示;
-        # 要调就写 freetoken.extra_args, 原样透传给 FreeToken。
-        #
-        # daemon 控制面 (ft daemon): 网关**经它**起停 engine, 这样 FreeToken
-        # 桌面版才能看见调用 (桌面版只认它自己那个 daemon; 网关自己 spawn 的
-        # engine 对它完全不存在, 实测 daemon 状态一直是 running:false)。
-        # 桌面版实际用 19000, 上游默认 1900; 留空 -> 先试 19000 再试 1900。
-        # 引擎端口 / 控制面端口: **FT 自己的约定, 网关不改**。
-        # 官方默认 (freetoken/daemon/server.py):
-        #     DEFAULT_PORT       = 1900  控制面
-        #     DEFAULT_SERVE_PORT = 1919  引擎
-        # 以前网关强行把引擎塞到 gateway.backend_port (8080), 结果桌面版按
-        # 1919 去找, 找不到 -> 永远「正在加载中」。
-        "port": 1919,
-        "daemon_port": 1900,
-        # state-dir: daemon 的锁/pidfile/serve.json/engine 日志都在这下面。
-        # 留空 -> 探测桌面版那份 (<用户profile>\.freetoken\daemon), 自启
-        # daemon 时也用它, 这样引擎日志位置可预期。
-        "state_dir": "",
-        # 桌面版没开时, 网关自己拉一个 daemon (按需加载仍然不加载模型,
-        # 只是把控制面备着)。关掉 = 桌面版没开就完全用不了这一组。
-        "autostart_daemon": True,
-        # 兜底附加参数 (字符串, 原样拆成 argv); 档位条目自己的
-        # freetoken_args 优先。默认留空 —— FT 有自己的一套弹性调度
-        # (README: Elastic Memory Management), 网关不替它选调度参数。
-        "extra_args": "",
-        # 告诉客户端 (Hermes 等) 最多能发多长。**这是网关对外的承诺上限,
-        # 不是让网关去分配显存** —— FT 实际 KV 由用户在 FT 控制面板里调,
-        # 网关只读 /v1/stats 压一道保险 (见 gateway._cap_context_to_kv)。
-        # 0 = 不设上限, 只报引擎实际值。
-        "kv_target": 262144,
-    },
     "models": [],
 }
 
@@ -823,8 +762,6 @@ def _merge_defaults(data: Dict[str, Any]) -> Dict[str, Any]:
             out["kvmem"].update(v)
         elif k == "strata" and isinstance(v, dict):
             out["strata"].update(v)
-        elif k == "freetoken" and isinstance(v, dict):
-            out["freetoken"].update(v)
         else:
             out[k] = v
     for m in out["models"]:
@@ -892,15 +829,10 @@ def _normalize_model(m: Dict[str, Any]) -> Dict[str, Any]:
     # 运行时归属: "" = 主路由 (llama-server) 模型池;
     # "kvmem" = llama-kvmem-server 分支, 只由「⚡ KVMem」页托管。
     # "strata" = Strata 分支, 只由「🌐 Strata」页托管。
-    # "freetoken" = FreeToken 分支, 只由「⚡ FreeToken」页托管。
     base.setdefault("runtime", "")
     # Strata 档位指向自己的引擎配置 json (参数都在那个文件里, 不走 params)
     if base.get("runtime") == STRATA_RUNTIME:
         base.setdefault("strata_config", "")
-    # FreeToken 档位指向模型**目录**, 附加参数是一个原样拆成 argv 的字符串
-    if base.get("runtime") == FREETOKEN_RUNTIME:
-        base.setdefault("freetoken_model", "")
-        base.setdefault("freetoken_args", "")
     # 档位端口 (已废弃): 与主池统一用顶层 port, 运行时不再读这个字段。
     # 保留只为兼容老配置和 bat 导入留痕。
     base.setdefault("kvmem_port", "")
@@ -931,11 +863,6 @@ def _ensure_model_params(m: Dict[str, Any]) -> None:
         # Strata 档位的参数全在 strata-<档位>.json 里 (serve/server.py 传给
         # strata.exe 的是那个 args 数组), 一个 llama flag 都不吃。
         # 这里补出来的几百个 llama 参数只会让人误以为改了能生效, 所以清空。
-        params.clear()
-        return
-    if m.get("runtime") == FREETOKEN_RUNTIME:
-        # 同理: FreeToken 吃的是它自己的 flag (--moe-backend / --memory-ratio
-        # ...), 写在档位条目的 freetoken_args 里。补 llama 参数纯属误导。
         params.clear()
         return
     # kvmem 专属参数只给 kvmem 档位补齐 —— 主池模型不需要, 写了也用不上

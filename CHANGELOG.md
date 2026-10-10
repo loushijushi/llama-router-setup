@@ -7,6 +7,37 @@
 
 ## [Unreleased]
 
+### 移除
+
+- **彻底移除 FreeToken 集成** —— 回到「从来没有过 FreeToken」的状态
+  - 删除 `ftbridge.py`（整文件）
+  - `gateway.py`：删掉 `FREETOKEN` 常量与分组、`backend_port_of()` 的 FT 分支、
+    `freetoken_is_ready()`、`_freetoken_entry()`、`_command_freetoken()`、
+    `_freetoken_daemon*()`、`_freetoken_running()`、`_start_freetoken()`、
+    `_stop_freetoken()`、`_merge_freetoken_status()`、`_cap_context_to_kv()`、
+    `_sweep_orphan_spawn_workers()`，以及所有 `import ftbridge`
+    —— 现在是**三个**模型组：`pool` / `kvmem` / `strata`
+  - `config.py`：删掉 `FREETOKEN_RUNTIME` 和 DEFAULTS 里整个 `"freetoken"` 段
+  - `ui.py`：删掉「⚡ FreeToken」标签页（及其后端面板）、监控窗口的
+    `freetoken.*.log` 日志源、`/engine/*` 轮询噪声白名单；
+    标签顺序改为 服务 / 全局 / 模型 / ⚡KVMem / 🌐Strata / 偏好 / 环境
+  - `config.json` / `config.example.json`：删掉 `"freetoken"` 段和
+    `runtime == "freetoken"` 的档位条目
+  - **`/props` passthrough、`_handle_props()`、`_handle_api_tags()` 原样保留** ——
+    它们是通用合成端点，不依赖 FreeToken；主池 / KVMem / Strata 的行为不变
+  - 历史条目里的 FreeToken 记录保留（那是真实发生过的变更），但对应代码已不存在
+
+### 新增
+
+- **监控窗口进度条** —— 直观显示 prefill / 生成，不用翻日志
+  - `gateway.py` 新增 `GET /status`：Strata 有 `/status` 就透传，KVMem / 主池
+    （llama-server 没有这个端点）由网关合成一份字段一致的空壳
+  - `ui.py` 监控窗口顶部加进度条 + 文案，读 `/status` 每 2 秒刷新：
+    生成中 = 定长条 `generated/max` + tok/s；读 prompt（prefill）= 不定长动画 +
+    总 token 数；空闲/未加载 = 归零
+  - Strata 的 `/status` 顶层只有 `busy/phase/generated/max_tokens/prompt_tokens`
+    （没有 `state`/`tok_s`），判定用 `busy`，`tok_s` 缺失时退回日志 tail 的实时速度
+
 ### 固定
 
 - **FreeToken 完全归 FT 管，网关退成纯中转**

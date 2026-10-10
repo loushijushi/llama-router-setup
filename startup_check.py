@@ -204,19 +204,6 @@ def _check_strata_tier(m: Dict[str, Any]) -> Optional[str]:
     return None
 
 
-def _check_freetoken_model(m: Dict[str, Any]) -> Optional[str]:
-    """核实一个 FreeToken 档位 —— 它的模型是个**目录** (safetensors 等),
-    由 FreeToken 桌面版自己管, 网关只登记目录指针。"""
-    mid = m.get("id", "?")
-    d = m.get("freetoken_model", "") or m.get("model", "")
-    if not d:
-        return (f"[{mid}] 未登记模型目录 "
-                "(在 FreeToken 桌面版里选好模型后, 从「导入」登记一次)")
-    if not os.path.isdir(d):
-        return f"[{mid}] FreeToken 模型目录不存在: {d}"
-    return None
-
-
 def check_models() -> CheckItem:
     cfg = config.load()
     enabled = [m for m in cfg.get("models", []) if m.get("enabled", True)]
@@ -228,18 +215,11 @@ def check_models() -> CheckItem:
     for m in enabled:
         mid = m.get("id", "?")
         rt = str(m.get("runtime") or "")
-        # Strata / FreeToken 的模型由**各自的软件**管: 路径在 strata-*.json 或
-        # 模型目录里, 网关不维护。所以这里不查 `m["model"]`(那两个字段对它们
-        # 本来就是空的), 而是**问那个软件** —— 不这么做就是假报警。
+        # Strata 的模型由**它自己的软件**管: 路径在 strata-*.json 里,
+        # 网关不维护。所以这里不查 `m["model"]`(那个字段对它本来就是空的),
+        # 而是**问那个软件** —— 不这么做就是假报警。
         if rt == config.STRATA_RUNTIME:
             bad = _check_strata_tier(m)
-            if bad:
-                missing.append(bad)
-            else:
-                external.append(mid)
-            continue
-        if rt == config.FREETOKEN_RUNTIME:
-            bad = _check_freetoken_model(m)
             if bad:
                 missing.append(bad)
             else:

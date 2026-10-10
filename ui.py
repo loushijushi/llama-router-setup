@@ -40,7 +40,6 @@ import httpx
 import service
 import startup_check
 import strata
-import ftbridge
 
 APP_TITLE = "llama.cpp Router 管理 v3"
 
@@ -1085,11 +1084,6 @@ _POLL_GET_PATHS = (
     "/v1/models", "/v1/models/", "/models", "/models/sse",
     "/health", "/healthz", "/props", "/sw.js", "/service-worker.js",
     "/slots", "/metrics", "/api/tags", "/api/ps",
-    # FreeToken daemon 控制面 (19000) 上的**只读**接口 —— FreeToken 页会持续轮询
-    # 它们刷状态。实测 `/engine/status` 每秒好几条, 同样带个不同的临时源端口。
-    # 同名的 `/engine/start|switch|stop` 是 POST, 属于真实动作, 这里匹配不到
-    # (过滤器只丢 GET/HEAD), 不用另外操心。
-    "/engine/status", "/engine/health", "/engine/metrics",
 )
 _RE_ACCESS_LOG = re.compile(
     r'"(?:GET|HEAD)\s+(/\S*?)(?:\?[^"\s]*)?\s+HTTP/[\d.]+"')
@@ -1109,6 +1103,7 @@ _is_poll_noise = is_poll_noise
 
 
 # =========================================================================
+
 class MonitorWindow(tk.Toplevel):
     """实时显示 llama-server 日志和模型状态。
 
@@ -1177,6 +1172,9 @@ class MonitorWindow(tk.Toplevel):
         # 拖动窗口时挂起重绘: 拖动每帧都来 <Configure>, 而日志重绘是
         # 「删掉整个 Text + 逐行插最多 1500 行」, 两者撞在一起必卡。
         # 停止收到 <Configure> 后 150ms 没人再 reset, _end_drag 补一次渲染。
+        self._dragging = False
+        self._drag_timer = None
+        self._drag_since = 0.0
         self.bind("<Configure>", self._begin_drag, add="+")
         self.bind("<ButtonRelease-1>", self._end_drag, add="+")
         # UI 刷新
@@ -1249,6 +1247,18 @@ class MonitorWindow(tk.Toplevel):
                                     font=("Segoe UI", 9), foreground="#0066CC")
         self.health_lbl.pack(side=tk.LEFT, padx=(0, 16))
 
+        # 进度条: 实时显示 prefill / 生成 (读网关 /status)。
+        # 翻日志看进度太费劲, 这里给一条直观的: 阶段 + 第几个 token + tok/s。
+        prog_row = ttk.Frame(self, padding=(10, 2))
+        prog_row.pack(fill=tk.X, padx=8, pady=(0, 4))
+        self.prog_bar = ttk.Progressbar(prog_row, length=200, mode="determinate",
+                                        maximum=100)
+        self.prog_bar.pack(side=tk.LEFT, padx=(0, 8))
+        self.prog_var = tk.StringVar(value="进度: 空闲")
+        self.prog_lbl = ttk.Label(prog_row, textvariable=self.prog_var,
+                                  font=("Segoe UI", 9), foreground="#333333")
+        self.prog_lbl.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
         # 模型条**单独占一整行**: 主池 + KVMem 的模型都在这里, 一行放不下就
         # 自动换行 (见 _layout_models)。以前它跟健康标签挤在同一行用
         # pack(side=LEFT) 单行排, 模型一多 —— 尤其是排在后面的 KVMem 组 ——
@@ -1266,7 +1276,7 @@ class MonitorWindow(tk.Toplevel):
         log_box = ttk.Frame(self)
         log_box.pack(fill=tk.BOTH, expand=True, padx=8, pady=4)
         ttk.Label(log_box, text="📜 实时日志 (主池 router.*.log + KVMem kvmem.*.log "
-                                "+ Strata strata.*.log + FreeToken freetoken.*.log)",
+                                "+ Strata strata.*.log)",
                   font=("Segoe UI", 10, "bold")).pack(anchor=tk.W)
         log_inner = ttk.Frame(log_box)
         log_inner.pack(fill=tk.BOTH, expand=True, pady=(2, 0))
@@ -1288,31 +1298,51 @@ class MonitorWindow(tk.Toplevel):
         self._apply_wrap()
 
         # 滚动时检查是否在最底端, 不在最底端则暂停自动跟跳
-        def _on_scroll(_e=None):
-            # **别把程序自己的滚动当成用户在翻历史。** 以前这里谁一动就切状态,
-            # 而 `_render_logs` 每 500ms 全量重绘 + `see(tk.END)`, 文本框一收缩
-            # yview 就会抖一下 -> 跟跳被误判成 PAUSED, 用户观感就是「日志不跟了,
-            # 得点一下立即刷新才继续」。三个条件缺一不可:
-            #   1) 正在重绘 -> 一律忽略
-            #   2) 位置相对上一次**真的变了** -> 只是重绘引起的复位不算
-            #   3) 有真实事件 (滚轮/按键) 才允许暂停; 纯 <Configure> 不算
-            if getattr(self, "_rendering_logs", False):
-                return
+        def _settle_follow():
+            """在 Tk **真正滚完之后**再判定跟跳开关。
+
+            滚轮之前必失效的原因: Tk 的 `<MouseWheel>` 类绑定是在用户绑定
+            **之后**才执行的, 处理器里立刻读 yview() 拿到的还是滚动前的位置,
+            和上次一比 `abs(top-last) < 1e-6` -> 直接 return, `_eval_follow`
+            一次都没跑过 -> `_follow_tail` 永远是 False, 下一帧重绘又把用户弹回
+            原处, 表现就是「滚轮怎么滚都回不到跟跳」。
+            推迟到 idle 再读, 拿到的才是滚动后的真实位置, 「位置真的变了」这个
+            守卫也才有意义 (重绘自己 see() 完会同步 `_follow_top`, idle 比对时
+            相同 -> 不会被误判成用户操作)。
+            """
             try:
                 top, bottom = self.log_text.yview()
             except Exception:
                 return
             last = getattr(self, "_follow_top", None)
-            self._follow_top = top
-            if _e is None or (last is not None and abs(top - last) < 1e-6):
+            if last is not None and abs(top - last) < 1e-6:
                 return
+            self._follow_top = top
             _eval_follow(top, bottom)
+        def _on_scroll(_e=None):
+            # **别把程序自己的滚动当成用户在翻历史。** 以前这里谁一动就切状态,
+            # 而 `_render_logs` 每 500ms 全量重绘 + `see(tk.END)`, 文本框一收缩
+            # yview 就会抖一下 -> 跟跳被误判成 PAUSED, 用户观感就是「日志不跟了,
+            # 得点一下立即刷新才继续」。所以:
+            #   1) 正在重绘 -> 一律忽略
+            #   2) 只有**真实事件** (滚轮/按键) 才判定, 纯 <Configure> 不算
+            #   3) 判定推迟到 idle, 因为滚轮生效在处理器之后 (见 _settle_follow)
+            if getattr(self, "_rendering_logs", False):
+                return
+            if _e is None:
+                return
+            self.after_idle(_settle_follow)
         def _eval_follow(top, bottom):
             """统一判定跟跳开关。**只有真正在底部**才恢复跟跳; 一旦用户
             往上翻就保持 PAUSED, 没有任何自动恢复路径 —— 要恢复必须他自己
             拉回底部或点「立即刷新」。
             """
-            at_bottom = bottom >= 0.999 and top >= 0.999
+            # 「在底部」只看 bottom。top 天然是 1-可见比例: 停在最底时可见的是
+            # 最后几屏, top 就是 0.97 左右, 根本不会接近 1。以前这里还要求
+            # `top >= 0.999`, 于是永远判不成立 -> 用户拖到底/滚到底都恢复不了
+            # 跟跳, 只能点「立即刷新」(那条路径不经过这个判定)。探针实测:
+            # top=0.9708 bottom=1.0000 却判 at_bottom=False。
+            at_bottom = bottom >= 0.999
             if at_bottom:
                 if not self._follow_tail:
                     self._follow_tail = True
@@ -1734,39 +1764,26 @@ class MonitorWindow(tk.Toplevel):
         spin.focus_set()
 
     # ----------------- 后台: 日志 tail -----------------
-    # 主池 / KVMem / Strata / FreeToken 四组的日志都要 tail —— 运行时只有一组在跑,
+    # 主池 / KVMem / Strata 三组的日志都要 tail —— 运行时只有一组在跑,
     # 但用户看到的应该是同一份面板, 不该还要自己去分清「现在看的是哪个文件」。
-    #
-    # FreeToken 是个特例: 网关**不再自己 spawn** 它的 engine (那样桌面版看不见
-    # 调用), 改由 FreeToken 自己的 daemon 起, 所以 engine 的输出落在它的
-    # state-dir 里 (`<profile>\.freetoken\daemon\logs\serve-<port>.log`),
-    # 不是本目录。这里在**建面板时**把它解析成真实路径 —— 那一小会儿对话还没
-    # 建完, 不碰 daemon 也不碰网络, 解析失败就跳过这个文件。
     _LOG_FILES = ("router.out.log", "router.err.log",
                   "kvmem.out.log", "kvmem.err.log",
-                  "strata.out.log", "strata.err.log",
-                  "freetoken.out.log", "freetoken.err.log")
+                  "strata.out.log", "strata.err.log")
     # 这几个文件只有跑过对应分支才会有, 缺了不算异常 (否则指示器天天报"找不到")
     _LOG_OPTIONAL = ("kvmem.out.log", "kvmem.err.log",
-                     "strata.out.log", "strata.err.log",
-                     "freetoken.out.log", "freetoken.err.log")
+                     "strata.out.log", "strata.err.log")
     # 每个文件单独留多少行 (4 个文件, 总量和原来 out800+err200 一个量级)
     _FILE_LINE_MAX = 300
     # 首次读某个日志文件时, 从尾部往回退这么多字节再开始 (别从 0 把整个文件灌进来)
     _TAIL_SEEK_BACK = 64 * 1024
+    # 拖动标志的安全上限(秒): 超过这么久还认为在拖动, 就当卡死强制收尾,
+    # 否则 _dragging 一旦为 True 而 _end_drag 排不上, 日志面板会永久静止。
+    _DRAG_STUCK = 2.0
 
     @classmethod
     def _log_paths(cls) -> List[str]:
         log_dir = os.path.join(config.app_dir(), "logs")
-        paths = [os.path.join(log_dir, n) for n in cls._LOG_FILES]
-        try:
-            import ftbridge as _ft
-            for engine_log in _ft.engine_logs():
-                if engine_log not in paths:
-                    paths.append(engine_log)
-        except Exception:                                # noqa: BLE001
-            pass
-        return paths
+        return [os.path.join(log_dir, n) for n in cls._LOG_FILES]
 
     def _push_file(self, name: str, lines: List[str]) -> None:
         """把一个文件的新行同时写进「按 kind 合并的 buffer」和「按文件的 buffer」。
@@ -1854,10 +1871,8 @@ class MonitorWindow(tk.Toplevel):
         read_ok = False
         for path in self._log_paths():
             if not os.path.isfile(path):
-                # FreeToken 的 engine 日志在它自己的 state-dir 里, 桌面版没
-                # 起过 engine 时那个文件本来就不存在 —— 属正常, 别报缺文件
-                if (os.path.basename(path) not in self._LOG_OPTIONAL
-                        and "serve-" not in os.path.basename(path)):
+                # 这几个文件只有跑过对应分支才会有, 缺了不算异常
+                if os.path.basename(path) not in self._LOG_OPTIONAL:
                     missing.append(os.path.basename(path))
                 continue
             try:
@@ -1866,14 +1881,27 @@ class MonitorWindow(tk.Toplevel):
                     cur_size = os.path.getsize(path)
                 except OSError:
                     continue
-# 打开时别从文件开头灌: freetoken.err.log 这种能到几 MB, 从 0
+                # 打开时别从文件开头灌: kvmem.err.log 这种能到几 MB, 从 0
                 # 读会把**几小时前的历史**全倒进面板 —— 用户以为「不停在出现」,
-                # 其实那些是旧行 (daemon 启动横幅、几轮早就修好的 pid 冲突…)。
+                # 其实那些是旧行 (启动横幅、几轮早就修好的 pid 冲突…)。
                 # 首次读这个文件时从尾部往回退 _TAIL_SEEK_BACK 再开始。
                 first_time = path not in self._last_log_pos
                 last_pos = self._last_log_pos.get(path, 0)
                 if first_time and cur_size > self._TAIL_SEEK_BACK:
                     last_pos = cur_size - self._TAIL_SEEK_BACK
+                # **首次见到这个文件时, 用文件自己的 mtime 当「最后吐字时间」。**
+                # 原来只有真读到新行才写 _file_seen, 于是冷启动时所有文件的
+                # _file_seen 都缺省成「刚刚」-> 渲染里的「安静/活跃」二分判定
+                # 全部命中「活跃」-> 退化成先来先排 -> strata.out.log 永远垫底,
+                # 而「跟跳」看的就是最底下, 于是面板底部挂着几小时前的
+                # "[strata] stopping", 真正在写的 kvmem 埋在中间 —— 用户看到的
+                # 就是「模型在跑, 日志却是个老日志」。
+                # 取 mtime 才能在**第一次渲染**就分对, 不必等 30 秒超时。
+                if first_time:
+                    try:
+                        self._file_seen[os.path.basename(path)] = os.path.getmtime(path)
+                    except OSError:
+                        pass
                 # 文件被轮转/截断 -> 从头开始
                 if last_pos > cur_size:
                     last_pos = 0
@@ -1891,6 +1919,15 @@ class MonitorWindow(tk.Toplevel):
                 continue
             self._tail_lines += len(new_lines)
             self._push_file(os.path.basename(path), new_lines)
+            # 必须放在 _push_file **之后**: 它结尾会无条件把 _file_seen 写成
+            # 「刚刚读到」, 在前面设的 mtime 会被冲掉。冷启动这一轮读到的其实
+            # 是 64KB 回看窗口里的历史内容, 不代表「刚刚在写」, 所以这里用
+            # mtime 把它还原回去, 渲染的安静/活跃二分才判得对。
+            if first_time:
+                try:
+                    self._file_seen[os.path.basename(path)] = os.path.getmtime(path)
+                except OSError:
+                    pass
         return missing, err, read_ok
 
     def _tail_remote_once(self) -> Tuple[List[str], str, bool]:
@@ -1941,28 +1978,38 @@ class MonitorWindow(tk.Toplevel):
                 base = f"http://{self._host}:{self._port}"
                 # /health
                 try:
-                    with httpx.open_url(f"{base}/health", timeout=2) as r:
+                    with httpx.open_url(f"{base}/health", timeout=1.0) as r:
                         health = json.loads(r.read().decode("utf-8"))
                 except Exception as e:
                     health = {"status": f"无法连接: {e}"}
                 # /v1/models
                 try:
-                    with httpx.open_url(f"{base}/v1/models", timeout=2) as r:
+                    with httpx.open_url(f"{base}/v1/models", timeout=1.0) as r:
                         models_data = json.loads(r.read().decode("utf-8"))
                 except Exception:
                     models_data = {"data": []}
+                # /status: 实时进度 (阶段/prefill/生成/tok_s)。网关对没有这个
+                # 端点的后端会合成空壳, 所以这里永远拿得到字段。
+                try:
+                    with httpx.open_url(f"{base}/status", timeout=1.0) as r:
+                        status_data = json.loads(r.read().decode("utf-8"))
+                except Exception:
+                    status_data = {}
                 self._http_state = {
                     "health": health,
                     "models": models_data.get("data", []),
+                    "status": status_data,
                     "ts": _time.time(),
                 }
             except Exception:
-                self._http_state = {"health": {"status": "异常"}, "models": [], "ts": 0}
+                self._http_state = {"health": {"status": "异常"}, "models": [],
+                                    "status": {}, "ts": 0}
             # 固定 2 秒一轮 = 光这个线程就 1 次/秒 (/health + /v1/models),
             # 引擎/网关日志里那些轮询大半是我们自己制造的。**没变化就退避**:
             # 内容不变时逐步拉长到 15 秒, 一有变化立刻回到 2 秒。改了监控地址
             # 会 _http_kick.set() 立即醒来, 不受影响。
-            sig = json.dumps([health, models_data], sort_keys=True, default=str)
+            sig = json.dumps([health, models_data, status_data],
+                             sort_keys=True, default=str)
             if sig == getattr(self, "_http_last_sig", None):
                 self._http_backoff = min(15.0, max(
                     2.0, getattr(self, "_http_backoff", 2.0) * 1.6))
@@ -2051,6 +2098,16 @@ class MonitorWindow(tk.Toplevel):
             # 每轮先清标志: 万一上次渲染中途抛异常, _rendering_logs 会永远停在
             # True, 之后所有滚动事件都被忽略 (跟跳再也不响应)。
             self._rendering_logs = False
+            # 看门狗: _begin_drag 是 debounce, 只要 <Configure> 一直在来, 150ms
+            # 的 _end_drag 就永远被重排, _dragging 卡在 True -> 日志永久不重绘。
+            # <Configure> 不只拖窗口时来 (_refresh_ui 刷状态卡导致控件变尺寸同样
+            # 会触发), 一旦形成「刷新 -> 变尺寸 -> Configure -> 跳过渲染 -> 再刷新」
+            # 的自反馈, 就再也停不下来。这里兜底: 拖动标志超过 _DRAG_STUCK 秒
+            # 就强制收尾, 保证无论什么在持续发 Configure, 日志都能恢复更新。
+            if getattr(self, "_dragging", False):
+                _since = getattr(self, "_drag_since", 0.0) or time.time()
+                if time.time() - _since > self._DRAG_STUCK:
+                    self._end_drag()
             # 日志 buffer -> Text
             #
             # **两个跳过条件**, 都是为了拖窗口时的手感:
@@ -2099,6 +2156,10 @@ class MonitorWindow(tk.Toplevel):
         self._pending_render = True
 
     def _begin_drag(self, _e=None) -> None:
+        # 只有 False -> True 的**首次**进入才记时间戳。连续 <Configure> 不刷新它,
+        # 否则看门狗的时限会被无限往后推, 卡死时也就救不回来了。
+        if not getattr(self, "_dragging", False):
+            self._drag_since = time.time()
         self._dragging = True
         # 正经的 debounce: 每帧 <Configure> 都会走到这里, 所以每次都把上一个
         # 定时器撤掉重排。只有当 <Configure> 停止 (拖完/没在动) 时, 那个最后
@@ -2139,6 +2200,20 @@ class MonitorWindow(tk.Toplevel):
         _known = set(_prev)
         order = [n for n in _prev if n in self._file_lines]
         order += sorted(n for n in self._file_lines if n not in _known)
+        # **安静的上, 活跃的下, 组内顺序不动。**
+        # 只按「先来先排」的话, strata.out.log 早被见过就永远钉在末尾 —— 而
+        # 「跟跳」是 see(tk.END), 面板最底下就成了 strata 那句几小时前的
+        # "stopping", 真正在写的 kvmem 反而埋在它上面。用户看到的正是
+        # 「模型在跑, 日志却是个老日志」。
+        # 曾经按活跃度整体排序, 但那样每来一批新日志整个 buffer 的位置都会变,
+        # 视图反复回跳 (见下面 _follow_top 用行号而不是比例的原因)。所以这里
+        # 只做「安静/活跃」二分: 组内稳定不跳, 跨组只在安静满 _QUIET 秒时挪一次。
+        _now = time.time()
+        _QUIET = 30.0
+        _seen = getattr(self, "_file_seen", None) or {}
+        _age = lambda n: _now - _seen.get(n, 0.0)
+        order = [n for n in order if _age(n) > _QUIET] + \
+                [n for n in order if _age(n) <= _QUIET]
         self._file_order = order
         all_lines: List[Tuple[str, str]] = []          # (kind, line)
         for name in order:
@@ -2156,14 +2231,25 @@ class MonitorWindow(tk.Toplevel):
         all_lines = all_lines[-1500:]
         # 记住**顶部可见行的行号**, 而不是 yview 比例。比例是相对的: 新日志
         # 不断追加时总行数在变, 同一个比例在重建后对应的是另一行 -> 用户手动
-        # 往上翻, 每 500ms 还在慢慢漂。行号是绝对的, 重建后 see 同一行即可
-        # 真正「停在原地」。
-        saved_top = None
+        # 往上翻, 每 500ms 还在慢慢漂。行号也不行: 见下面 anchor_txt 的说明。
+        anchor_txt = None
+        anchor_frac = 0.0
         if not self._follow_tail:
             try:
-                saved_top = self.log_text.index("@0,0")
+                # **记这一行的内容, 不记它的行号。**
+                # 行号是相对的: 这份 buffer 每次全量重建, 而重建时
+                #   - 「安静/活跃」排序会把整块文件搬到别处
+                #   - all_lines[-1500:] 会从顶上砍掉溢出的行
+                # 两者都会让行号整体位移, see(行号) 于是落到别的行上 ——
+                # 用户表现就是「往回翻之后日志自己在乱跳」。
+                # 记文本内容, 重建后用 search 反查回来, 位移多少都不影响。
+                anchor_txt = self.log_text.get("@0,0", "@0,0 lineend")
+                try:
+                    anchor_frac = self.log_text.yview()[0]
+                except Exception:
+                    anchor_frac = 0.0
             except Exception:
-                saved_top = None
+                anchor_txt = None
 
         self.log_text.configure(state=tk.NORMAL)
         # 全量重绘 (buffer 已经限长, 可直接写)
@@ -2192,10 +2278,17 @@ class MonitorWindow(tk.Toplevel):
         if self._follow_tail:
             self.log_text.see(tk.END)
             self._follow_top = self.log_text.yview()[0]
-        elif saved_top:
-            # 用户在翻历史 -> 钉住原来那一行, 谁也别动
+        elif anchor_txt:
+            # 用户在翻历史 -> 按**内容**钉住原来那一行, 谁也别动
             try:
-                self.log_text.see(saved_top)
+                _probe = anchor_txt.strip()[:120]
+                _idx = self.log_text.search(_probe, "1.0", tk.END,
+                                            backwards=True) if _probe else ""
+                if _idx:
+                    self.log_text.see(_idx)
+                else:
+                    # 这一行已经被挤出 buffer -> 按比例兜底, 别硬跳到顶
+                    self.log_text.yview_moveto(anchor_frac)
             except Exception:
                 pass
             self._follow_top = self.log_text.yview()[0]
@@ -2209,6 +2302,75 @@ class MonitorWindow(tk.Toplevel):
         except Exception:                                # noqa: BLE001
             pass
         self.log_text.configure(state=tk.DISABLED)
+
+    def _render_progress(self, st: dict) -> None:
+        """进度条: 读网关 /status, 直观显示 prefill / 生成。
+
+        Strata 的 /status 有 state/phase/prompt_tokens/generated/max_tokens/
+        tok_s/elapsed_s; KVMem/主池是合成空壳 (state=idle, 其余 None)。
+        - 生成中: 进度条 = generated/max_tokens, 文案带 tok/s
+        - 读 prompt 中 (还没出第一个 token): 进度条走不定长, 文案带已读 token 数
+        - 空闲/未加载: 进度条归零
+        """
+        s = st.get("status") or {}
+        # Strata 的 /status 顶层字段是 busy/phase/generated/max_tokens/
+        # prompt_tokens, **没有 state/tok_s/elapsed_s** (实测)。KVMem/主池走网关
+        # 合成空壳, 有 state 没有 busy。所以两种都要认。
+        state = str(s.get("state") or "")
+        busy = bool(s.get("busy"))
+        generating = busy or state == "generating"
+        phase = str(s.get("phase") or "")
+        gen = s.get("generated")
+        mx = s.get("max_tokens")
+        ptok = s.get("prompt_tokens")
+        tok_s = s.get("tok_s")
+        el = s.get("elapsed_s")
+        # tok_s 不在 /status 里 -> 退回日志 tail 解析出的实时速度
+        if tok_s is None:
+            latest = getattr(self, "_last_speed", {}).get("__latest__", {})
+            tok_s = latest.get("tg")
+        prefill = generating and (gen in (None, 0))
+        try:
+            if generating and not prefill and gen is not None:
+                frac = 0.0
+                if mx:
+                    frac = max(0.0, min(1.0, float(gen) / float(mx)))
+                if getattr(self, "_prog_mode", None) != "determinate":
+                    try:
+                        self.prog_bar.stop()
+                    except Exception:
+                        pass
+                    self.prog_bar.configure(mode="determinate")
+                    self._prog_mode = "determinate"
+                self.prog_bar["value"] = round(frac * 100, 1)
+                rate = f"{tok_s:.1f} tok/s" if isinstance(tok_s, (int, float)) else "—"
+                eltxt = f", {el:.0f}s" if isinstance(el, (int, float)) else ""
+                self.prog_var.set(
+                    f"进度: {phase or '生成'} {gen}/{mx if mx else '?'} tokens, {rate}{eltxt}")
+                self.prog_lbl.configure(foreground="#0066cc")
+            elif prefill:
+                if getattr(self, "_prog_mode", None) != "indeterminate":
+                    self.prog_bar.configure(mode="indeterminate")
+                    self.prog_bar.start()
+                    self._prog_mode = "indeterminate"
+                pt = f"{ptok:,}" if isinstance(ptok, int) else "?"
+                eltxt = f", {el:.0f}s" if isinstance(el, (int, float)) else ""
+                self.prog_var.set(f"进度: 读取 prompt {pt} tokens{eltxt} (prefill)")
+                self.prog_lbl.configure(foreground="#cc6600")
+            else:
+                if getattr(self, "_prog_mode", None) != "determinate":
+                    try:
+                        self.prog_bar.stop()
+                    except Exception:
+                        pass
+                    self.prog_bar.configure(mode="determinate")
+                    self._prog_mode = "determinate"
+                self.prog_bar["value"] = 0
+                txt = "空闲" if state in ("idle", "") else (state or "未加载")
+                self.prog_var.set(f"进度: {txt}")
+                self.prog_lbl.configure(foreground="#888888")
+        except Exception:
+            pass
 
     def _render_status(self) -> None:
         """更新状态条 (模型标签原地更新, 避免 destroy/recreate 导致 tooltip 闪烁)。"""
@@ -2239,6 +2401,7 @@ class MonitorWindow(tk.Toplevel):
                 self._addr_state_var.set("无法连接")
                 self._addr_state_lbl.configure(foreground="#cc0000")
         models = st.get("models", [])
+        self._render_progress(st)
         # 生成速度是从日志 tail 出来的; 没拿到远程日志之前不显示, 避免冒充
         latest = self._last_speed.get("__latest__", {})
 
@@ -2369,8 +2532,7 @@ class MonitorWindow(tk.Toplevel):
         if tags:
             lines.append("组: " + ", ".join(
                 {"pool": "主池", "kvmem": "KVMem",
-                 "strata": "Strata",
-                 "freetoken": "FreeToken"}.get(str(t), str(t))
+                 "strata": "Strata"}.get(str(t), str(t))
                 for t in tags))
         aliases = m.get("aliases", [])
         if aliases:
@@ -2877,13 +3039,12 @@ class App(tk.Tk):
         self.nb = ttk.Notebook(self)
         self.nb.pack(fill=tk.BOTH, expand=True, padx=8, pady=4)
         # 标签顺序: 服务(0) / 全局(1) / 模型(2) / ⚡KVMem(3) / 🌐Strata(4)
-        #           / ⚡FreeToken(5) / 偏好(6) / 环境(7)
+        #           / 偏好(5) / 环境(6)
         self._build_service_tab()
         self._build_global_tab()
         self._build_models_tab()
         self._build_kvmem_tab()
         self._build_strata_tab()
-        self._build_freetoken_tab()
         self._build_prefs_tab()
         self._build_env_tab()
         self.nb.bind("<<NotebookTabChanged>>", self._on_tab_changed)
@@ -2898,8 +3059,8 @@ class App(tk.Tk):
     def _on_tab_changed(self, _evt) -> None:
         current = self.nb.index(self.nb.select())
         # 标签顺序: 服务(0) / 全局(1) / 模型(2) / ⚡KVMem(3) / 🌐Strata(4)
-        #           / ⚡FreeToken(5) / 偏好(6) / 环境(7)
-        if current == 7:  # 环境
+        #           / 偏好(5) / 环境(6)
+        if current == 6:  # 环境
             self._refresh_env()
             return
         if current in (1, 2, 3):
@@ -2912,8 +3073,6 @@ class App(tk.Tk):
             self._refresh_kvmem_tab()
         if current == 4:  # 🌐Strata
             self._refresh_strata_tab()
-        if current == 5:  # ⚡FreeToken
-            self._refresh_freetoken_tab()
 
     def _build_env_tab(self) -> None:
         f = ttk.Frame(self.nb, padding=10)
@@ -4628,712 +4787,6 @@ class App(tk.Tk):
                 return
         messagebox.showinfo("提示", "还没有 Strata 日志，先应用并重装一次服务。")
 
-    # ==============================================================
-    # 「⚡ FreeToken」页
-    #
-    # 和另三页同一套骨架 (顶部说明 / 左=列表+基础信息 / 右=参数面板 /
-    # 底部=运行服务)。和 Strata 页的差别: FreeToken 的档位**不是**一个
-    # 参数 json, 就是「一个模型目录 + 一串它自己的 flag」, 所以右边的
-    # 参数面板小得多 —— 没有逐项 flag 表, 一个输入框放整串参数。
-    #
-    # 底部多一个「🚀 打开 FreeToken 设置」按钮: 直接拉起它的桌面版,
-    # 让你去那边设置 (下载模型、挑后端等)。要提醒的是**桌面版和网关这一组
-    # 互不相干** —— 桌面版会自己管一个 daemon + engine, 两边同时加载同一个
-    # 模型就是双份显存, 所以按钮旁边的提示写明了。
-    # ==============================================================
-    def _build_freetoken_tab(self) -> None:
-        f = ttk.Frame(self.nb, padding=8)
-        self.nb.add(f, text="⚡ FreeToken")
-        self.ftws = ModelWorkspace("freetoken")
-        W = self.ftws
-
-        top_bar = ttk.Frame(f)
-        top_bar.pack(fill=tk.X, side=tk.TOP, pady=(0, 8))
-        ttk.Label(
-            top_bar,
-            text="  👉 界面与「模型」「⚡KVMem」「🌐Strata」三页一致，只是由 "
-                 "FreeToken 运行；档位 = 一个模型目录 + 一串它自己的参数，"
-                 "对外调用地址与其余三组共用同一个网关端口",
-            foreground="#555").pack(side=tk.LEFT, fill=tk.Y, padx=4, pady=4)
-
-        self._build_freetoken_service_box(f)
-
-        paned = ttk.PanedWindow(f, orient=tk.HORIZONTAL)
-        paned.pack(fill=tk.BOTH, expand=True)
-
-        # ---- 左: 档位列表 (与另三页同位置) ----
-        left = ttk.Frame(paned, padding=(0, 0, 6, 0))
-        paned.add(left, weight=1)
-        ttk.Label(left, text="已登记的 FreeToken 档位:").pack(anchor=tk.W)
-        lf = ttk.Frame(left)
-        lf.pack(fill=tk.X, pady=(2, 4))
-        W.model_list = tk.Listbox(lf, height=6, exportselection=False,
-                                  font=("Consolas", 10))
-        W.model_list.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        W.model_list.bind("<<ListboxSelect>>", self._on_freetoken_select)
-        sb = ttk.Scrollbar(lf, orient=tk.VERTICAL, command=W.model_list.yview)
-        sb.pack(side=tk.RIGHT, fill=tk.Y)
-        W.model_list.config(yscrollcommand=sb.set)
-        lb_btns = ttk.Frame(left)
-        lb_btns.pack(fill=tk.X, pady=(0, 6))
-        for label, cmd in [
-            ("扫描模型", self._on_freetoken_scan),
-            ("删除", self._on_freetoken_remove),
-            ("上移", lambda: self._freetoken_move(-1)),
-            ("下移", lambda: self._freetoken_move(1)),
-        ]:
-            ttk.Button(lb_btns, text=label, command=cmd).pack(
-                side=tk.LEFT, expand=True, fill=tk.X, padx=1)
-        ttk.Separator(left, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=(0, 6))
-        self._build_freetoken_editor(left, W)
-
-        # ---- 右: 参数面板 (与另三页同一位置) ----
-        right = ttk.Frame(paned, padding=(6, 0, 0, 0))
-        paned.add(right, weight=2)
-        box_par = ttk.LabelFrame(
-            right, text="档位参数 (FreeToken 自己的 flag，保存后重启服务生效)",
-            padding=6)
-        box_par.pack(fill=tk.BOTH, expand=True)
-        self.ft_par_hint = tk.StringVar(value="")
-        ttk.Label(box_par, textvariable=self.ft_par_hint, foreground="#555",
-                  wraplength=420).pack(fill=tk.X, pady=(0, 4))
-        af = ttk.LabelFrame(box_par, text="ft serve 附加参数", padding=4)
-        af.pack(fill=tk.X, pady=(0, 6))
-        ttk.Label(af, text="空格分隔, 原样拆成 argv:", wraplength=400).pack(
-            anchor=tk.W)
-        self.ft_args_var = tk.StringVar(value="")
-        ttk.Entry(af, textvariable=self.ft_args_var).pack(fill=tk.X, pady=(2, 0))
-        ttk.Label(af, foreground="#777", wraplength=400,
-                  text="常用: --moe-backend auto|offload|hybrid  --memory-ratio 0.85"
-                       "  --max-running-requests 4  --gpu 0\n"
-                       "(FreeToken 一个 llama flag 都不认; 想看全部可用的跑 "
-                       "`ft serve --help`)").pack(anchor=tk.W, pady=(3, 0))
-
-        nf = ttk.LabelFrame(box_par, text="本机安装情况", padding=4)
-        nf.pack(fill=tk.X, pady=(6, 0))
-        self.ft_found_var = tk.StringVar(value="")
-        ttk.Label(nf, textvariable=self.ft_found_var, foreground="#555",
-                  font=("Consolas", 9), justify=tk.LEFT).pack(anchor=tk.W)
-
-        df = ttk.LabelFrame(
-            box_par,
-            text="daemon 控制面 (网关经它起停 engine，这样 FreeToken 桌面版才看得见调用)",
-            padding=4)
-        df.pack(fill=tk.X, pady=(6, 0))
-        self.ft_daemon_var = tk.StringVar(value="")
-        ttk.Label(df, textvariable=self.ft_daemon_var, foreground="#555",
-                  font=("Consolas", 9), justify=tk.LEFT,
-                  wraplength=440).pack(anchor=tk.W)
-        db = ttk.Frame(df)
-        db.pack(fill=tk.X, pady=(4, 0))
-        ttk.Button(db, text="🔄 探测 daemon", width=13,
-                   command=self._on_freetoken_probe_daemon).pack(side=tk.LEFT)
-        # 桌面端点一下加载就会把 engine 抢到 1919 (daemon 一次只管一个)。
-        # 约定是「加载统一归网关, 桌面端只读」, 所以给一个不用发请求就能抢回来的
-        # 按钮 —— 否则得故意发一个请求去触发切换。
-        ttk.Button(db, text="↩ 抢回 8080", width=12,
-                   command=self._on_freetoken_reclaim).pack(side=tk.LEFT,
-                                                              padx=(4, 0))
-        # KV 缓存不做任何操作: FreeToken 自己的弹性内存管理负责专家缓存与 KV
-        # 之间的重分配, 网关只读 /v1/cache/status 展示, 不越权改它的池子。
-        # 要调就把 FreeToken 自己的参数写进 freetoken.extra_args。
-        ttk.Label(db, text="  KV 缓存归 FreeToken 自己管 (网关只读, 不改)",
-                  foreground="#888").pack(side=tk.LEFT, padx=(4, 0))
-
-        sf = ttk.LabelFrame(box_par, text="运行时状态 (后端在跑时的 /health + /v1/stats)",
-                            padding=4)
-        sf.pack(fill=tk.BOTH, expand=True, pady=(6, 0))
-        self.ft_stats_var = tk.StringVar(value="(后端没跑)")
-        ttk.Label(sf, textvariable=self.ft_stats_var, foreground="#555",
-                  font=("Consolas", 9), justify=tk.LEFT,
-                  wraplength=440).pack(anchor=tk.W)
-
-        pb = ttk.Frame(box_par)
-        pb.pack(fill=tk.X, pady=(6, 0))
-        ttk.Button(pb, text="📂 换模型目录", width=13,
-                   command=self._on_freetoken_pick_models_dir).pack(
-                       side=tk.RIGHT, padx=(0, 6))
-        ttk.Button(pb, text="📂 换安装目录", width=13,
-                   command=self._on_freetoken_pick_install_dir).pack(
-                       side=tk.RIGHT, padx=(0, 2))
-        self.ft_par_msg = tk.StringVar(value="")
-        ttk.Label(pb, textvariable=self.ft_par_msg,
-                  foreground="#a05000").pack(side=tk.LEFT)
-
-        self._refresh_freetoken_tab()
-
-    def _build_freetoken_service_box(self, parent: ttk.Frame) -> None:
-        """底部运行服务区 (与另三页同位置、同按钮排布) + 打开桌面版。"""
-        box_svc = ttk.LabelFrame(
-            parent,
-            text="运行服务 (llama-router，与主池/KVMem/Strata 共用同一个服务和同一个对外端口)",
-            padding=6)
-        box_svc.pack(side=tk.BOTTOM, fill=tk.X, pady=(6, 0))
-        btns = [
-            ("应用并重装", self._on_freetoken_install),
-            ("切回主池", self._on_freetoken_to_pool),
-            ("✔ 设为当前", self._on_freetoken_set_active),
-            ("启动", self._on_freetoken_start),
-            ("停止", self._on_freetoken_stop),
-            ("重启", self._on_freetoken_restart),
-            ("前台运行", self._on_freetoken_fg),
-            ("刷新状态", self._on_freetoken_refresh_status),
-            ("📂 日志", self._on_freetoken_open_log),
-        ]
-        for i, (label, cmd) in enumerate(btns):
-            ttk.Button(box_svc, text=label, width=10, command=cmd).grid(
-                row=0, column=i, padx=2, pady=2)
-        # 「打开 FreeToken 设置」单独一行 —— 它不是网关的操作, 是把 FreeToken
-        # 自己的桌面版叫起来, 放在按钮行里会让人以为网关在管它。
-        ttk.Button(box_svc, text="🚀 打开 FreeToken 设置",
-                   width=22, command=self._on_freetoken_open_desktop).grid(
-                       row=1, column=0, sticky=tk.W, padx=2, pady=(6, 0))
-        ttk.Label(box_svc, text="就绪超时(秒):").grid(
-            row=1, column=3, sticky=tk.E, pady=(6, 0))
-        self.ft_timeout_var = tk.StringVar(value="600")
-        ttk.Entry(box_svc, textvariable=self.ft_timeout_var,
-                  width=6).grid(row=1, column=4, sticky=tk.W, padx=(3, 0))
-        ttk.Button(box_svc, text="保存", width=8,
-                   command=self._on_freetoken_save_timeout).grid(
-            row=1, column=5, sticky=tk.W, padx=(6, 0))
-        box_svc.columnconfigure(0, weight=1)
-        self.ft_state_var = tk.StringVar(value="运行服务: 未知")
-        ttk.Label(box_svc, textvariable=self.ft_state_var).grid(
-            row=2, column=0, columnspan=5, sticky=tk.W, pady=(3, 0))
-        self.ft_url_var = tk.StringVar(value="调用地址: -")
-        ttk.Label(box_svc, textvariable=self.ft_url_var,
-                  foreground="#0666CC").grid(row=2, column=5, columnspan=2,
-                                             sticky=tk.W, pady=(3, 0))
-        ttk.Button(box_svc, text="📋 复制调用地址",
-                   command=self._on_freetoken_copy_url).grid(
-            row=2, column=7, columnspan=2, sticky=tk.W, pady=(3, 0))
-        self.ft_hint_var = tk.StringVar(value="")
-        ttk.Label(box_svc, textvariable=self.ft_hint_var,
-                  foreground="#a05000", wraplength=760).grid(
-            row=3, column=0, columnspan=9, sticky=tk.W, pady=(3, 0))
-
-    # ---- FreeToken 页: 基础信息 (与另三页同一位置) ----
-    def _build_freetoken_editor(self, master: ttk.Frame, W) -> None:
-        """基础信息区。字段与另三页同一套骨架, 换成 FreeToken 的口径。
-
-        最大的差别: 「模型」是**目录**而不是 .gguf —— `ft serve --model`
-        收的就是一个模型目录, 里面有权重 (config.json / *.safetensors /
-        *.gguf)。所以浏览按钮用 askdirectory。
-        """
-        W = W if W is not None else self.ftws
-        top_bar = ttk.Frame(master)
-        top_bar.pack(fill=tk.X, padx=4, pady=(0, 4), side=tk.TOP)
-        ttk.Label(top_bar, text="⚠  修改后点右上角「保存」",
-                  foreground="#666").pack(side=tk.LEFT, padx=10, pady=4)
-        ttk.Button(top_bar, text="💾  保存",
-                   command=lambda: self._on_freetoken_save_entry(W)).pack(
-                       side=tk.RIGHT, padx=10, pady=2)
-
-        box1 = ttk.LabelFrame(master, text="基础信息", padding=6)
-        box1.pack(fill=tk.X, padx=4, pady=(0, 4))
-        W.var_id = tk.StringVar()
-        W.var_alias = tk.StringVar()
-        W.var_model = tk.StringVar()          # -> freetoken_model (目录!)
-        W.var_enabled = tk.BooleanVar(value=True)
-        rows = [
-            (0, 0, "ID*", W.var_id, None, "text"),
-            (0, 2, "别名 alias", W.var_alias, None, "text"),
-            (1, 0, "模型目录*", W.var_model, "dir", "text"),
-        ]
-        for row, col, label, var, browse_ft, kind in rows:
-            sub = ttk.Frame(box1)
-            sub.grid(row=row, column=col, sticky=tk.EW, padx=(0, 8), pady=2)
-            ttk.Label(sub, text=label + ":").pack(side=tk.LEFT)
-            entry = ttk.Entry(sub, textvariable=var)
-            entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 0))
-            if browse_ft:
-                ttk.Button(sub, text="…", width=3,
-                           command=lambda v=var, k=browse_ft:
-                           self._browse(v, k)).pack(side=tk.LEFT, padx=(2, 0))
-        ttk.Checkbutton(box1, text="启用 (未启用则不出现在 /v1/models)",
-                        variable=W.var_enabled).grid(row=2, column=0, columnspan=4,
-                                                     sticky=tk.W, pady=(2, 0))
-        box1.columnconfigure(0, weight=1)
-        box1.columnconfigure(1, weight=0)
-        box1.columnconfigure(2, weight=1)
-        box1.columnconfigure(3, weight=0)
-
-    # ---- FreeToken 页: 清单与状态 ----
-    def _refresh_freetoken_tab(self) -> None:
-        W = getattr(self, "ftws", None)
-        if W is None or not hasattr(W, "model_list"):
-            return
-        cfg = self.cfg
-        self.ft_timeout_var.set(str((cfg.get("freetoken") or {}).get(
-            "ready_timeout", 600)))
-        active = ftbridge.active_model(cfg)
-        W.model_list.delete(0, tk.END)
-        W.model_idx = []                  # 列表行 -> cfg["models"] 下标
-        sel_pos = None
-        for i, m in enumerate(ftbridge.freetoken_models(cfg)):
-            mid = str(m.get("id") or "?")
-            alias = m.get("alias") or ""
-            tag = " (停用)" if not m.get("enabled", True) else ""
-            mark = " ✔" if (active and str(active.get("id")) == mid) else ""
-            label = f"{mid}" + (f"  ({alias})" if alias and alias != mid else "") \
-                + tag + mark
-            W.model_list.insert(tk.END, label)
-            W.model_idx.append(i)
-            if sel_pos is None and active and str(active.get("id")) == mid:
-                sel_pos = len(W.model_idx) - 1
-        if sel_pos is not None:
-            W.model_list.selection_set(sel_pos)
-            self._freetoken_select_at(sel_pos)
-        else:
-            self._freetoken_clear_params()
-            if ftbridge.freetoken_models(cfg):
-                self.ft_url_var.set("调用地址: -")
-            else:
-                self.ft_url_var.set(f"调用地址: -   (没有档位, "
-                                    f"先点「扫描模型」从 "
-                                    f"{ftbridge.models_dir(cfg)} 里登记)")
-        self.ft_found_var.set(
-            f"版本 {ftbridge.version(cfg) or '未识别'}\n"
-            f"python  {ftbridge.find_python(cfg) or '✗ 没找到 (必须是它自带的 venv)'}\n"
-            f"ft.exe  {ftbridge.find_ft_exe(cfg) or '✗ 没找到'}\n"
-            f"桌面版  {ftbridge.desktop_exe(cfg) or '✗ 没找到'}\n"
-            f"模型目录 {ftbridge.models_dir(cfg)}\n"
-            f"安装目录 {ftbridge.install_dir(cfg)}")
-        self._refresh_freetoken_daemon()
-        self._on_freetoken_refresh_status()
-
-    def _refresh_freetoken_daemon(self) -> None:
-        """把 daemon / engine 状态写出来。
-
-        这段是**故意露出来的**: 网关经 daemon 起停 engine, 所以「桌面版看不看
-        得到调用」取决于它那个 daemon 在不在。看不到时先来这里确认一眼, 比在
-        两边来回猜快得多。
-        """
-        if not hasattr(self, "ft_daemon_var"):
-            return
-        cfg = self.cfg
-        alive = ftbridge.daemon_alive(cfg)
-        lines = [f"daemon {ftbridge.daemon_base(cfg)}: "
-                 f"{'在' if alive else '**不在**'}"]
-        lines.append("state-dir %s" % (ftbridge.state_dir(cfg) if alive
-                                       else ftbridge.own_state_dir(cfg)))
-        if not alive and not bool((cfg.get("freetoken") or {}).get(
-                "autostart_daemon", True)):
-            lines.append("自启已关: 桌面版没开时这一组用不了")
-        st = ftbridge.engine_status(cfg)
-        if st:
-            lines.append("engine: %s  端口 %s  pid %s" % (
-                "running" if st.get("running") else
-                ("starting" if st.get("starting") else "stopped"),
-                st.get("port"), st.get("pid")))
-            if st.get("lastExitReason"):
-                lines.append("上次退出: %s" % st.get("lastExitReason"))
-            # 桌面端把引擎挪走时要说清楚 —— 这是「模型加载了却调不通」最常见的
-            # 原因 (daemon 一次只管一个 engine, 桌面端用 1919 请求就会顶掉我们
-            # 放在 8080 上的那个)
-            try:
-                if st.get("running") and int(st.get("port") or 0) != \
-                        ftbridge.port_of(cfg):
-                    lines.append("⚠ 引擎在 %s, 不是网关的 %s —— 桌面端加载的?"
-                                 % (st.get("port"), ftbridge.port_of(cfg)))
-                    lines.append("   点「↩ 抢回 %s」把它切回来"
-                                 % ftbridge.port_of(cfg))
-            except (TypeError, ValueError):
-                pass
-        else:
-            lines.append("engine: 问不到 (daemon 没响应)")
-        lines.append("engine 日志: %s"
-                     % os.path.basename(ftbridge.engine_log(cfg)))
-        self.ft_daemon_var.set("\n".join(lines))
-
-    def _on_freetoken_probe_daemon(self) -> None:
-        """手动探一次 daemon + engine 状态 (出问题时先点这个)。"""
-        self._refresh_freetoken_daemon()
-        self._on_freetoken_refresh_stats()
-        self._log(f"FreeToken daemon: {self.ft_daemon_var.get()}")
-
-    def _on_freetoken_reclaim(self) -> None:
-        """把 daemon 管的 engine 抢回网关的共用口。
-
-        桌面端点一下加载, daemon 就会把 engine 挪到 1919 (它一次只管一个) ——
-        那时路由这边就「什么都没加载」但显存被占着。点这个把它切回来, 不用
-        特意发一个请求去触发。
-        """
-        cfg = self.cfg
-        self.status_var.set("正在把 FreeToken engine 抢回 "
-                            f"{ftbridge.port_of(cfg)} …")
-        self.update_idletasks()
-        ok, msg = ftbridge.reclaim(cfg)
-        if not ok:
-            messagebox.showerror("FreeToken", msg)
-            self._log(f"✘ 抢回 engine 失败: {msg}")
-        else:
-            self._log(f"✔ {msg}")
-            # 引擎要几十秒才就绪, 别让状态栏一直显示旧的
-            self.ft_hint_var.set(
-                f"{msg} —— 权重搬进显存要几十秒, 就绪后 "
-                f"{ftbridge.port_of(cfg)} 和网关 {self.cfg.get('port')} 都能调。")
-        self._refresh_freetoken_tab()
-
-    def _on_freetoken_scan(self) -> None:
-        """扫描模型目录, 挑一个登记成档位。"""
-        items = ftbridge.scan_models(self.cfg)
-        ok = [it for it in items if it["ok"]]
-        if not items:
-            messagebox.showinfo(
-                "FreeToken",
-                f"{ftbridge.models_dir(self.cfg)} 下没找到任何模型目录。\n"
-                f"可以点右下「📂 换模型目录」指到别处, 或者点底部"
-                f"「🚀 打开 FreeToken 设置」在它自己的界面里下载。")
-            return
-        dlg = tk.Toplevel(self)
-        dlg.title("扫描到的 FreeToken 模型")
-        ttk.Label(dlg, text=f"  选一个登记成档位 (扫描自 "
-                            f"{ftbridge.models_dir(self.cfg)})",
-                  foreground="#555").pack(anchor=tk.W, padx=8, pady=(8, 4))
-        lb = tk.Listbox(dlg, height=min(12, max(4, len(items))), width=64)
-        lb.pack(fill=tk.BOTH, expand=True, padx=8)
-        for it in items:
-            lb.insert(tk.END, it["dir"] if it["ok"] else f"{it['dir']}  — {it['why']}")
-        row = ttk.Frame(dlg)
-        row.pack(fill=tk.X, padx=8, pady=8)
-
-        def _ok() -> None:
-            sel = lb.curselection()
-            if not sel:
-                messagebox.showinfo("提示", "请先选一个模型目录")
-                return
-            it = items[sel[0]]
-            if not it["ok"]:
-                messagebox.showerror("FreeToken", f"这个目录不能用\n{it['why']}")
-                return
-            dlg.destroy()
-            self._freetoken_register_entry(it)
-
-        ttk.Button(row, text="登记为档位", command=_ok).pack(side=tk.LEFT)
-        ttk.Button(row, text="取消",
-                   command=dlg.destroy).pack(side=tk.RIGHT)
-
-    def _freetoken_register_entry(self, it: Dict[str, Any]) -> None:
-        entry = ftbridge.entry_from_dir(it["path"])
-        models = self.cfg.setdefault("models", [])
-        for m in models:
-            if m.get("runtime") == config.FREETOKEN_RUNTIME:
-                if ftbridge.model_dir_of(m) == entry["freetoken_model"]:
-                    messagebox.showinfo(
-                        "FreeToken", f"这个模型已经登记过了: {entry['id']}")
-                    return
-        models.append(entry)
-        ft = self.cfg.setdefault("freetoken", {})
-        if not str(ft.get("active_id") or ""):
-            ft["active_id"] = entry["id"]
-        self._log(f"已登记 FreeToken 档位 {entry['id']} "
-                  f"({entry['freetoken_model']})")
-        self._refresh_freetoken_tab()
-
-    def _freetoken_move(self, delta: int) -> None:
-        """上移 / 下移: 只在 models 清单里换位置, 不碰档位本身。"""
-        W = self.ftws
-        sel = W.model_list.curselection()
-        if not sel:
-            messagebox.showinfo("提示", "请先选中一个档位")
-            return
-        pos = sel[0]
-        target = pos + delta
-        items = ftbridge.freetoken_models(self.cfg)
-        if not (0 <= target < len(items)):
-            return
-        cur = items[pos]
-        nxt = items[target]
-        models = self.cfg.get("models") or []
-        i, j = models.index(cur), models.index(nxt)
-        models[i], models[j] = models[j], models[i]
-        self._log(f"FreeToken 档位顺序: {cur.get('id')} -> {nxt.get('id')}")
-        self._refresh_freetoken_tab()
-        self._freetoken_select_at(target)
-
-    def _freetoken_sel_model(self) -> Optional[Dict[str, Any]]:
-        W = self.ftws
-        sel = W.model_list.curselection()
-        if not sel:
-            return None
-        pos = sel[0]
-        items = ftbridge.freetoken_models(self.cfg)
-        return items[pos] if 0 <= pos < len(items) else None
-
-    def _freetoken_select_at(self, pos: int) -> None:
-        W = self.ftws
-        items = ftbridge.freetoken_models(self.cfg)
-        if not (0 <= pos < len(items)):
-            return
-        m = items[pos]
-        W.var_id.set(str(m.get("id") or ""))
-        W.var_alias.set(str(m.get("alias") or ""))
-        W.var_model.set(ftbridge.model_dir_of(m))
-        W.var_enabled.set(bool(m.get("enabled", True)))
-        self._freetoken_load_params(m)
-
-    def _on_freetoken_select(self, _evt=None) -> None:
-        sel = self.ftws.model_list.curselection()
-        if sel:
-            self._freetoken_select_at(sel[0])
-
-    # ---- FreeToken 页: 参数 (读/写档位条目的 freetoken_args) ----
-    def _freetoken_clear_params(self) -> None:
-        if not hasattr(self, "ft_args_var"):
-            return
-        self.ft_args_var.set("")
-        self.ft_par_hint.set("请先在左边选一个已登记的档位")
-        self.ft_stats_var.set("(后端没跑)")
-
-    def _freetoken_load_params(self, m: Dict[str, Any]) -> None:
-        if not hasattr(self, "ft_args_var"):
-            return
-        self.ft_args_var.set(str(m.get("freetoken_args") or ""))
-        bits = [f"目录 {ftbridge.model_dir_of(m)}"]
-        if m.get("freetoken_args"):
-            bits.append("附加参数有值")
-        self.ft_par_hint.set("  |  ".join(bits))
-        self._on_freetoken_refresh_status()
-
-    def _on_freetoken_pick_install_dir(self) -> None:
-        """指 FreeToken 安装目录 (换机器 / 装多份时用)。"""
-        d = filedialog.askdirectory(title="选 FreeToken 安装目录",
-                                    initialdir=ftbridge.install_dir(self.cfg))
-        if d:
-            self.cfg.setdefault("freetoken", {})["install_dir"] = d
-            self._log(f"FreeToken 安装目录 -> {d}")
-            self._refresh_freetoken_tab()
-
-    def _on_freetoken_pick_models_dir(self) -> None:
-        """指模型根目录 (自动扫描的来源)。"""
-        d = filedialog.askdirectory(title="选 FreeToken 模型根目录",
-                                    initialdir=ftbridge.models_dir(self.cfg))
-        if d:
-            self.cfg.setdefault("freetoken", {})["models_dir"] = d
-            self._log(f"FreeToken 模型目录 -> {d}")
-            self._refresh_freetoken_tab()
-
-    def _on_freetoken_save_timeout(self) -> None:
-        ft = self.cfg.setdefault("freetoken", {})
-        try:
-            ft["ready_timeout"] = max(30, int(self.ft_timeout_var.get().strip()))
-        except ValueError:
-            messagebox.showerror("FreeToken", "就绪超时请填一个整数秒数")
-            return
-        self._log(f"FreeToken 就绪超时 -> {ft['ready_timeout']}s")
-        self._refresh_freetoken_tab()
-
-    def _on_freetoken_save_entry(self, W=None) -> None:
-        """保存当前档位的基础信息 + 附加参数。
-
-        FreeToken 档位只有一个模型目录和一串参数, 所以这里只写两个字段;
-        **不清空** 其它组的档位, 也不去动 FreeToken 自己的任何配置文件
-        (它的设置在桌面版里, 本页只管网关怎么起它)。
-        """
-        W = W if W is not None else self.ftws
-        m = self._freetoken_sel_model()
-        if not m:
-            messagebox.showinfo("提示", "请先在左边选中一个 FreeToken 档位")
-            return
-        mid = W.var_id.get().strip()
-        if not mid:
-            messagebox.showerror("FreeToken", "ID 不能为空")
-            return
-        mdir = W.var_model.get().strip()
-        if not mdir:
-            messagebox.showerror("FreeToken", "模型目录不能为空")
-            return
-        if not os.path.isdir(mdir):
-            messagebox.showerror("FreeToken", f"模型目录不存在:\n{mdir}")
-            return
-        old_id = str(m.get("id") or "")
-        new_id = mid
-        m["id"] = new_id
-        m["alias"] = W.var_alias.get().strip()
-        m["freetoken_model"] = os.path.abspath(mdir)
-        m["freetoken_args"] = self.ft_args_var.get().strip()
-        m["enabled"] = bool(W.var_enabled.get())
-        ft = self.cfg.setdefault("freetoken", {})
-        if str(ft.get("active_id") or "") == old_id and old_id != new_id:
-            ft["active_id"] = new_id
-        # 别的组里撞了同一个 id 就会路由到错的那一组 —— 这是真会踩的坑
-        for other in self.cfg.get("models", []) or []:
-            if other is m:
-                continue
-            if str(other.get("id") or "") == new_id:
-                messagebox.showerror(
-                    "FreeToken",
-                    f"ID {new_id} 已经被另一个组 ('{other.get('runtime') or 'pool'}')"
-                    f"占用了 —— 两个组同名会让网关路由到错的后端。换个 ID。")
-                m["id"] = old_id
-                if str(ft.get("active_id") or "") == old_id:
-                    ft["active_id"] = old_id
-                self._refresh_freetoken_tab()
-                return
-        self.ft_par_msg.set("已保存")
-        if ftbridge.is_installed():
-            self.ft_hint_var.set(
-                "档位已更新。要换成这个模型, 点「设为当前」再「重启」服务 "
-                "—— 冷加载要把权重搬进显存, 可能要几分钟。")
-        self._refresh_freetoken_tab()
-
-    def _on_freetoken_set_active(self) -> None:
-        m = self._freetoken_sel_model()
-        if not m:
-            messagebox.showinfo("提示", "请先选中一个 FreeToken 档位")
-            return
-        mid = str(m.get("id") or "")
-        self.cfg.setdefault("freetoken", {})["active_id"] = mid
-        self._log(f"FreeToken 当前档位 -> {mid}")
-        if ftbridge.is_installed():
-            self.ft_hint_var.set(
-                "当前档位已改。切过去要重启服务 (换档位 = 换进程, 因为一次只能"
-                "跑一个模型), 冷加载可能要几分钟。")
-        self._refresh_freetoken_tab()
-
-    def _on_freetoken_remove(self) -> None:
-        m = self._freetoken_sel_model()
-        if not m:
-            messagebox.showinfo("提示", "请先选中一个 FreeToken 档位")
-            return
-        mid = str(m.get("id") or "")
-        if not messagebox.askyesno(
-                "FreeToken",
-                f"把 FreeToken 档位 {mid} 从清单里移除?\n\n"
-                f"(只删清单里的登记, 不会删 "
-                f"{ftbridge.models_dir(self.cfg)} 下的模型文件)"):
-            return
-        models = self.cfg.get("models") or []
-        for m2 in [x for x in models
-                   if x.get("runtime") == config.FREETOKEN_RUNTIME
-                   and str(x.get("id") or "") == mid]:
-            models.remove(m2)
-        ft = self.cfg.setdefault("freetoken", {})
-        if str(ft.get("active_id") or "") == mid:
-            ft["active_id"] = ""
-        self._log(f"已移除 FreeToken 档位 {mid}")
-        self._refresh_freetoken_tab()
-
-    def _on_freetoken_copy_url(self) -> None:
-        url = service.gateway_base_url(self.cfg)
-        try:
-            self.clipboard_clear()
-            self.clipboard_append(url)
-            self._log(f"已复制调用地址: {url}")
-        except tk.TclError:
-            self._log(f"调用地址: {url}")
-
-    def _freetoken_done(self, ok: bool, msg: str) -> None:
-        if not ok:
-            messagebox.showerror("FreeToken", msg)
-        else:
-            self._log(f"FreeToken: {msg}")
-        self._refresh_freetoken_tab()
-
-    def _on_freetoken_install(self) -> None:
-        self.cfg["serve_mode"] = config.FREETOKEN_RUNTIME
-        self._freetoken_done(*ftbridge.install(self.cfg))
-
-    def _on_freetoken_to_pool(self) -> None:
-        # "router" 就是主池 (它是个多模型进程池, 组内切换不用重启)
-        self.cfg["serve_mode"] = "router"
-        self._freetoken_done(*service.install(self.cfg))
-
-    def _on_freetoken_start(self) -> None:
-        self._freetoken_done(*ftbridge.start())
-
-    def _on_freetoken_stop(self) -> None:
-        self._freetoken_done(*ftbridge.stop())
-
-    def _on_freetoken_restart(self) -> None:
-        self._freetoken_done(*ftbridge.restart())
-
-    def _on_freetoken_fg(self) -> None:
-        self._freetoken_done(*ftbridge.run_foreground(self.cfg))
-
-    def _on_freetoken_open_desktop(self) -> None:
-        ok, msg = ftbridge.open_desktop(self.cfg)
-        if not ok:
-            messagebox.showerror("FreeToken", msg)
-            return
-        self.ft_hint_var.set(
-            f"{msg}。注意: 桌面版自己管一个 daemon + engine, 和网关这一组"
-            f"互不相干 —— 两边同时加载同一个模型就是双份显存 (本机只有 16GB), "
-            f"会 OOM。要走网关调用就别在桌面版里加载, 关掉它那边的模型即可。")
-        self._log(f"FreeToken: {msg}")
-
-    def _on_freetoken_refresh_status(self) -> None:
-        if not hasattr(self, "ft_state_var"):
-            return
-        text = f"运行服务: {service.status(ftbridge.SERVICE_NAME)}"
-        port = ftbridge.port_of(self.cfg)
-        text += f"   FreeToken 后端 127.0.0.1:{port}"
-        if ftbridge.port_busy(port):
-            text += " (端口在用)"
-        h = ftbridge.health(self.cfg, timeout=2.0)
-        if h:
-            text += f"   /health={h.get('status')}"
-            mdl = h.get("model")
-            if mdl:
-                text += f" ({mdl})"
-        self.ft_state_var.set(text)
-        self._on_freetoken_refresh_stats(h)
-
-    def _on_freetoken_refresh_stats(self, h=None) -> None:
-        """把 FreeToken 的 /v1/stats 摊开 —— 它比别家给得多 (显存/吞吐/请求)。"""
-        if not hasattr(self, "ft_stats_var"):
-            return
-        st = ftbridge.stats(self.cfg, timeout=2.0)
-        if st:
-            kv = st.get("kv") or {}
-            model = st.get("model") or {}
-            pages = kv.get("total_pages")
-            ctx = model.get("ctx")
-            lines = [f"KV 缓存 {kv.get('used_pages')}/{pages} 页 "
-                     f"(用掉 {100.0 * (kv.get('used_pages') or 0) / pages:.0f}%)"
-                     if pages else "KV 缓存: 未知"]
-            if pages and ctx and pages < ctx:
-                lines.append("⚠ 只有 %d 页, 模型标称 %d —— 长对话会被引擎丢弃"
-                             % (pages, ctx))
-                lines.append("   点「↩ 重设 KV 缓存」按当前显存预算重新分配")
-            elif pages and ctx:
-                lines.append("上下文已达模型上限 %d" % ctx)
-            for g in st.get("gpus") or []:
-                # 注意字段大小写: **engine 自己的 /v1/stats 是 snake_case**
-                # (`total_bytes`), 而 daemon 转发的 /engine/stats 是 camelCase
-                # (`totalBytes`) —— 两个都认, 免得哪天换了入口就显示成 0。
-                tot = (g.get("total_bytes") if g.get("total_bytes") is not None
-                       else g.get("totalBytes")) or 0
-                lines.append("GPU %s %s  共 %.1fGB"
-                             % (g.get("index"), g.get("name"), tot / 1024 ** 3))
-            vr = st.get("vram_bytes")
-            if vr is None:
-                vr = st.get("vramBytes")
-            if vr:
-                lines.append("引擎占用显存 %.2fGB" % (vr / 1024 ** 3))
-            tp = st.get("throughput") or {}
-            if tp:
-                lines.append("解码 %s tok/s  预填 %s tok/s"
-                             % (tp.get("decode_tps"), tp.get("prefill_tps")))
-            rq = st.get("requests") or {}
-            if rq:
-                lines.append("请求 进行中 %s  已完成 %s  p95 %sms  首token均值 %sms"
-                             % (rq.get("active"), rq.get("completed"),
-                                rq.get("p95_ms"), rq.get("ttft_mean_ms")))
-            if h and h.get("maintenance"):
-                lines.append("维护状态 %s" % h.get("maintenance"))
-            self.ft_stats_var.set("\n".join(lines) or "(没有可显示的统计)")
-        else:
-            self.ft_stats_var.set("(后端没跑, 或 /v1/stats 不可用)")
-
-    def _on_freetoken_open_log(self) -> None:
-        for path in (ftbridge.err_log(), ftbridge.out_log()):
-            if os.path.isfile(path):
-                self._open_file(path)
-                return
-        messagebox.showinfo("提示", "还没有 FreeToken 日志，先应用并重装一次服务。")
-
     def _on_draft_enable_toggle(self, W=None) -> None:
         W = W if W is not None else self
         """启用/停用推测解码: 控制折叠按钮可用性与面板显示。"""
@@ -5404,7 +4857,6 @@ class App(tk.Tk):
             path = filedialog.askopenfilename(
                 filetypes=[("可执行文件", "*.exe"), ("所有", "*.*")])
         elif kind == "dir":
-            # FreeToken 的模型是**目录** (`--model-path` 收的是目录), 不是单文件
             path = filedialog.askdirectory()
         else:
             path = filedialog.askopenfilename()
@@ -5849,10 +5301,9 @@ class App(tk.Tk):
         W.model_idx = []
         for i, m in enumerate(self.cfg["models"]):
             rt = m.get("runtime")
-            # Strata / FreeToken 档位由各自那一页托管 (Strata 的参数在
-            # strata-*.json 里; FreeToken 的模型是目录 + 它自己的 flag
-            # —— 参数面板对它俩都没有意义), 不能混进这两页
-            if rt in (config.STRATA_RUNTIME, config.FREETOKEN_RUNTIME):
+            # Strata 档位由「🌐 Strata」页托管 (它的参数在 strata-*.json 里,
+            # 参数面板对它没有意义), 不能混进这两页
+            if rt == config.STRATA_RUNTIME:
                 continue
             if (rt == config.KVMEM_RUNTIME) != want_kv:
                 continue
@@ -6274,18 +5725,14 @@ class App(tk.Tk):
         elif mode == "strata":
             act = strata.active_model(cur) or {}
             want = f"Strata 档位 {act.get('alias') or act.get('id') or '?'}"
-        elif mode == config.FREETOKEN_RUNTIME:
-            act = ftbridge.active_model(cur) or {}
-            want = f"FreeToken 档位 {act.get('alias') or act.get('id') or '?'}"
         else:
             want = "主池"
         preload = bool((cur.get("gateway") or {}).get("preload", False))
         if live:
             # 网关报的是组 id (kvmem), 这里翻成中文名, 和另几页口径一致
             cn = {"pool": "主池", "kvmem": "KVMem",
-                  "strata": "Strata",
-                  "freetoken": "FreeToken"}.get(str(live.get("active")),
-                                                 str(live.get("active")))
+                  "strata": "Strata"}.get(str(live.get("active")),
+                                             str(live.get("active")))
             tag = f"运行时 {cn} / {live.get('active_model') or '?'}"
         elif preload:
             tag = f"默认 {want}"
