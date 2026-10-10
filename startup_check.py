@@ -171,6 +171,52 @@ def check_llama_dir() -> CheckItem:
                      detail=f"{exe}")
 
 
+def _check_strata_tier(m: Dict[str, Any]) -> Optional[str]:
+    """核实一个 Strata 档位的模型文件 —— **问它自己的 json**。
+
+    Strata 的模型路径在 `strata-<档位>.json` 的 `args` 里 (`--native` /
+    `--ple-gguf`), 网关不存也不该存。旧实现只看 `m["model"]`, 而那个字段
+    对 Strata 档位本来就是空的 -> 一律报「未设置 model 路径」, 是**假报警**。
+
+    返回 None = 没问题; 返回字符串 = 有问题。
+    """
+    mid = m.get("id", "?")
+    cfgp = m.get("strata_config", "")
+    if not cfgp:
+        return f"[{mid}] 未登记 strata-<档位>.json 路径"
+    if not os.path.isfile(cfgp):
+        return f"[{mid}] Strata 档位 json 不存在: {cfgp}"
+    try:
+        import strata
+        data = strata.load_tier(m) or {}
+    except Exception as e:                               # noqa: BLE001
+        return f"[{mid}] 读档位 json 失败: {type(e).__name__}: {e}"
+    args = data.get("args") or []
+    native = None
+    for i, a in enumerate(args):
+        if a in ("--native", "--model") and i + 1 < len(args):
+            native = args[i + 1]
+            break
+    if not native:
+        return f"[{mid}] 档位 json 里没有 --native (Strata 自己认这个为准)"
+    if not os.path.isfile(native):
+        return f"[{mid}] Strata 的模型文件不存在: {native}"
+    return None
+
+
+def _check_freetoken_model(m: Dict[str, Any]) -> Optional[str]:
+    """核实一个 FreeToken 档位 —— 它的模型是个**目录** (safetensors 等),
+    由 FreeToken 桌面版自己管, 网关只登记目录指针。"""
+    mid = m.get("id", "?")
+    d = m.get("freetoken_model", "") or m.get("model", "")
+    if not d:
+        return (f"[{mid}] 未登记模型目录 "
+                "(在 FreeToken 桌面版里选好模型后, 从「导入」登记一次)")
+    if not os.path.isdir(d):
+        return f"[{mid}] FreeToken 模型目录不存在: {d}"
+    return None
+
+
 def check_models() -> CheckItem:
     cfg = config.load()
     enabled = [m for m in cfg.get("models", []) if m.get("enabled", True)]
@@ -178,8 +224,27 @@ def check_models() -> CheckItem:
         return CheckItem(key="models", name="模型文件", ok=False,
                          detail="config.json 中没有启用的模型")
     missing: List[str] = []
+    external: List[str] = []
     for m in enabled:
         mid = m.get("id", "?")
+        rt = str(m.get("runtime") or "")
+        # Strata / FreeToken 的模型由**各自的软件**管: 路径在 strata-*.json 或
+        # 模型目录里, 网关不维护。所以这里不查 `m["model"]`(那两个字段对它们
+        # 本来就是空的), 而是**问那个软件** —— 不这么做就是假报警。
+        if rt == config.STRATA_RUNTIME:
+            bad = _check_strata_tier(m)
+            if bad:
+                missing.append(bad)
+            else:
+                external.append(mid)
+            continue
+        if rt == config.FREETOKEN_RUNTIME:
+            bad = _check_freetoken_model(m)
+            if bad:
+                missing.append(bad)
+            else:
+                external.append(mid)
+            continue
         path = m.get("model", "")
         if not path:
             missing.append(f"[{mid}] 未设置 model 路径")
@@ -196,9 +261,13 @@ def check_models() -> CheckItem:
             key="models", name="模型文件", ok=False,
             detail="\n".join(missing) + "\n  模型文件需从 HuggingFace 等来源手动下载",
         )
+    tail = ""
+    if external:
+        tail = ("\n  （其中 %d 个由各自软件管: %s —— 已按它们的配置核实）"
+                % (len(external), ", ".join(external)))
     return CheckItem(
         key="models", name="模型文件", ok=True,
-        detail=f"{len(enabled)} 个启用模型，文件均存在",
+        detail=f"{len(enabled)} 个启用模型，文件均存在{tail}",
     )
 
 

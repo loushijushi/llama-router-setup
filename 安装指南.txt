@@ -45,10 +45,12 @@ test-router.bat        测试所有启用模型的切换
      c) 「模型」页：增删改模型条目；可以填多模态 mmproj 路径；
         推测解码用「启用推测解码」勾选开启，草稿文件可选
      d) 切到「服务」页 → 点「安装服务」
-     e) 等待「服务已安装并启动」
+     e) 等待「服务已安装并启动 (网关)」
 
 4. 浏览器访问  http://127.0.0.1:8080/v1/models
-   看到模型列表即为成功。
+   看到模型列表即为成功。列表里**主池和 KVMem 两组模型都在**
+   （每条的 tags 是 pool 或 kvmem）—— 服务跑的是网关 gateway.py，
+   它按请求里的 model 名把流量转给对应后端。
 
 四、日常使用
 -----------
@@ -57,8 +59,16 @@ test-router.bat        测试所有启用模型的切换
 * 卸服务   → 双击 uninstall-router.bat（管理员）
 * 看日志   → UI「服务」页底部日志框，或 status-router.bat
 * API 调用：base_url  = http://127.0.0.1:8080/v1
-           model     = 配置里每个模型的 alias 字段
+           model     = 配置里每个模型的 alias 字段（主池和 KVMem 两组
+                       共用这个地址，写谁的名字网关就转给谁）
 * 命令行测试：双击 test-router.bat
+* 远程看日志：UI「监控」窗口地址栏填对方地址即可。
+  前提是对方那台也跑本软件，并且在「全局」页勾上「日志转发」。
+  连不上时窗口会直接告诉你原因；如果是超时，多半是 Windows
+  防火墙在静默丢包 —— 在**远程那台**点「🛡 放行端口」一键加规则
+  （会弹 UAC；拒绝提权时按提示手动跑那条 netsh 命令）。
+* 用过的地址会记在地址栏下拉里（⚙ 历史设置可改条数、可清空），
+  点一下就自动连上，存在 user_preferences.json，不会进发布包。
 
 五、模型设置
 -----------
@@ -91,8 +101,125 @@ test-router.bat        测试所有启用模型的切换
                   且该项控件自动置灰。设置保存在模型配置里，
                   重新选中该模型会原样回读。老配置默认全部勾选，
                   与升级前的输出完全一致。
+    * 视觉模型 / KV 内存加载  贴在「推测解码」下方的折叠区块
+                  （开关栏常驻、默认折叠、点开关展开）。
+                  面板是固定高度 + 纵向滚动条 + 鼠标滚轮，
+                  窗口矮也不怕：滚轮一滚就能看完全部 12 项。
+                  12 项分三组：
+                  视觉模型(mmproj)：mmproj-auto / mmproj-offload /
+                      mmproj-device / 图像 min|max tokens / 多模态批 tokens
+                  KV 缓存：kv-offload / kv-unified / cache-ram /
+                      cache-type-k / cache-type-v
+                  模型加载：load-mode
+                      (auto / none / mmap / mlock / mmap+mlock / dio)
+                  每项自带勾选框：勾了才写入 preset.ini，
+                  不勾就沿用 llama.cpp 默认值。这 12 项不会在右侧
+                  「常用 / 扩展参数」子表里重复出现。
+                  注意：cache-type-k/v 是**按模型**各自生效的，
+                  所以也放在这里，不在参数子表里。
 
-六、显存与空闲策略
+六、KVMem 分支（llama-kvmem-server）
+------------------------------
+这是另一套程序：C:\llama.cpp\kvmem-llama.cpp\ 分支自带的
+llama-kvmem-server.exe。它**不是**主路由的池成员（它自述
+"Independent single-slot server. Does not patch llama-server."），
+是另一个程序、单槽、一次只跑一个模型。
+但它和主池**共用同一个服务 llama-router、同一个端口**
+（config.host / config.port，默认 0.0.0.0:8080）——
+这个服务跑的是**网关 gateway.py**，它占住 8080，后端只绑本机的
+8081（主池）/ 8082（KVMem）、不对外。网关按请求里的 model 名
+（id 或 alias 都行，大小写不敏感）把流量转给对应后端；两个后端
+互斥，同一时刻只有一个在跑，切换由网关完成，调用方无感。
+
+所以本工具给它单独开一个标签页「⚡ KVMem」，和主池共用同一份
+模型清单（同一条 config.json models），但**不写进
+router-preset.ini** —— 主 llama-server 不认识 --kvmem-* 参数。
+
+* 标签页结构
+    ① 档位区：列出所有 runtime=kvmem 的条目（单选，一次只能
+       选一个），显示 ctx / 预算 / 预留 / 思考开关
+       （端口是服务级的，统一在「全局」页，档位行不再各写一个）。
+       「✔ 设为当前档位」写入 config.kvmem.active_id，
+       下次重装服务按当前档位取参数。
+       「➡ 去模型页编辑」跳到模型页改同一条记录
+       （模型文件、mmproj、视觉、推测解码都在那边）。
+    ② 运行服务区：应用并重装 / 切回主池 / 启动 / 停止 / 重启 /
+       前台运行 / 刷新状态 / 打开日志。
+       服务名就是 llama-router（和「服务」页是同一个，端口也是同一个）。
+       「应用并重装」= 校验当前档位 + 写 serve_mode=kvmem 再重装服务；
+       「切回主池」= 写 serve_mode=router 再重装服务。
+       服务装的是网关 gateway.py，重装只是让网关重启、按 serve_mode
+       拉起对应后端；平时发请求带谁的 model 名，网关就自己切到谁。
+       改了任何参数都要**重新点一次「应用并重装」**才生效。
+       另有 CUDA 设备输入（写进服务环境变量，不占配置文件）。
+    ③ 参数区：常用 = kvmem-budget / kvmem-gen-reserve /
+       enable-thinking / reasoning-budget / ctx-size /
+       parallel / jinja；扩展里是 kvmem / kvmem-block-tokens /
+       kvmem-query-policy / kvmem-method / ui-dir / verbosity
+       等 9 个 KVMem 专属项。
+    ④ 底部「💾 保存 KVMem 配置」。
+
+* 模型清单怎么加档位
+    两个办法，推荐第一个：
+    ① 从分支自带的 bat 导入（见下面「从已有的 .bat 导入参数」）
+    ② 手动：「模型」页 → 新增 → 把 runtime 改成 kvmem。
+       （老字段 kvmem_port 已废弃：端口统一读顶层 port，不用填）
+    已有 3 个档位（对应分支目录里那 3 个 bat，id 按 bat 名取）：
+      编码档       ctx 262144  预算 24576  预留 12288  思考开
+      快速问答档   ctx  32768  预算 16384  预留  4096  思考关
+      长文档       ctx 262144  预算 32768  预留  4096  思考开
+    三者共用同一个模型文件和 mmproj，区别只有上面这几项。
+    在模型列表里，这 3 条会带「⚡分支」标记。
+    三个档位共用 8080，但同一时刻只有一个在跑，不会冲突
+    （跟主池也不会冲突——主池和分支本来就只会有一个在跑）。
+
+* 从已有的 .bat 导入参数
+    分支目录里的 start-*.bat 已经写好了一整套启动参数，不用一项项抄：
+      「⚡ KVMem」页 → 「📂 导入 bat…」
+      或「模型」页 → 「导入bat」
+    弹出文件选择框，可按住 Ctrl/Shift 多选（只认 .bat，不认 .ps1；
+    不扫目录，也不支持拖入）。
+
+    导入时会做的事：
+    1) 跑一次 <exe> -h，把短名和别名归一：
+         -c → ctx-size，-n → n-predict，-ctk → cache-type-k，
+         --no-X → X=false；认不出值的走启发式判断。
+    2) bat 里**每一个** flag 都落进 config.json：
+         · schema 里有的 → 打开该项并写入 bat 给的值
+         · schema 里没有的 → 自动登记成「额外参数」
+           （存在 user_preferences.json 的 extra_params），一个都不丢
+    3) 先按 schema 把参数补齐、再**全部关掉**，只把 bat 里出现的
+       置为写入 —— bat 是唯一真相，bat 没写的就沿用 llama.cpp 默认值
+    4) 条目怎么认（按顺序）：
+         同 id                                → 覆盖
+         同 runtime + 同模型路径 + 关键档位参数打分
+         （预算 / ctx / 预留 / 思考预算，每对上一个算一分）→ 覆盖原条目
+         都不匹配                             → 新建
+       覆盖时保留原来的 id 和 alias，所以「✔ 设为当前档位」的选择
+       不会失效。你的几个档位共用同一个 gguf，靠打分各归各的，
+       不会全灌进第一条。
+    5) bat 里的 set K=V → config.kvmem.cuda_device / cuda_device_order
+       bat 里的 --host/--port **不照抄**：主池和分支已统一用
+       config.host / config.port（「全局」页改），导入报告会提示已忽略。
+    6) 重新生成 router-preset.ini，刷新模型列表 / 档位区 / 两个参数
+       面板，最后弹一个汇总框告诉你每个 bat 落到了哪条、登记了哪些
+       额外参数、有没有失败的。
+
+    重复导入同一个 bat 是幂等的（第二次结果与第一次完全一样）。
+    分支档位照旧不写进 router-preset.ini。
+    如果运行服务已经装了，导入后要**再点一次「应用并重装」**，
+    新参数才会生效。
+
+* 调用地址
+    http://127.0.0.1:8080/v1 （端口就是「全局」页的 config.port），
+    model 名就是条目的 alias/id（大小写不敏感，主池和 KVMem 都认）。
+    「📋 复制调用地址」直接复制当前档位的地址。
+    **主池和 KVMem 分支是同一个地址** —— 网关 gateway.py 按 model 名
+    路由，同一时刻只跑一个后端；请求里写哪个组的名字，网关就把哪个组
+    拉起来（首次切换要等模型加载，会慢几十秒，之后就快了）。
+    没带 model 或名字认不出来时，交给当前正在跑的后端处理。
+
+七、显存与空闲策略
 ----------------
 空闲卸载时间：「全局」页 → 空闲 N 秒后自动卸载，默认 3600 (1 小时)。
 llama-server 到点会调用 sleep，把模型从显存卸载到 RAM（保留 KV），
@@ -109,7 +236,7 @@ llama-server 到点会调用 sleep，把模型从显存卸载到 RAM（保留 KV
   POST /models/unload 卸载最久未用的模型，为其它程序腾显存。
   注意：watchdog 依赖 nvidia-smi（NVIDIA 驱动自带），需在 PATH 中。
 
-七、常见问题
+八、常见问题
 -----------
 Q1: 提示「需要管理员权限」
 A1: 以管理员身份运行 manager-ui.bat；或者只通过 UI 改配置，
@@ -158,7 +285,7 @@ A9: 三层机制按优先级：
     ③ sleep-idle-seconds：空闲到点自动 sleep 释放显存
     ④ 手动：UI「服务」页 → 停止 / 卸载 llama-router，把显存让给别的程序
 
-八、打包分发给别人的方法
+九、打包分发给别人的方法
 --------------------
 A) 推荐：打成 zip 直接发
    整个文件夹压缩成 zip → 别人解压到任意目录 → 装 Python → 双击 manager-ui.bat
@@ -179,11 +306,11 @@ C) 安装包：NSIS / Inno Setup
    完全图形化向导式安装，适合给完全不懂电脑的人用。工作量大。
    如果真要：建议先用 B) 的 exe 跑通，再让 NSIS 包成 .msi/.exe。
 
-九、卸载
+十、卸载
 -------
 双击 uninstall-router.bat（管理员），即可彻底删除 Windows 服务。
 config.json 和模型文件不会被删，下次想用再 install 即可。
 
-十、版本
+十一、版本
 -------
 v2 (2025)：引入 config.json 数据源、可视化 UI、参数开关、MTP/DFlash 草稿模型、显存 watchdog。

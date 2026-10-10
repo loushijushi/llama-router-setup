@@ -91,6 +91,18 @@ def _list_loaded_models(base: str) -> list[dict]:
     return []
 
 
+def _status_value(m: dict) -> str:
+    """router 的 /models 里 status 是 {"value": ..., "args": [...]} (dict)。
+
+    旧版实现直接拿 status 跟字符串比较, 结果永远不相等,
+    _pick_unload_target 一直返回 None —— 这里统一取出 value。
+    """
+    st = m.get("status", "")
+    if isinstance(st, dict):
+        return str(st.get("value", ""))
+    return str(st or "")
+
+
 def _pick_unload_target(base: str, min_idle_seconds: int) -> Optional[str]:
     """从已加载模型里选一个可卸载的目标。
 
@@ -105,7 +117,7 @@ def _pick_unload_target(base: str, min_idle_seconds: int) -> Optional[str]:
         return None
     candidates = []
     for m in models:
-        status = m.get("status", "")
+        status = _status_value(m)
         if status == "unloaded":
             continue
         # 必须支持 router 管理
@@ -116,12 +128,12 @@ def _pick_unload_target(base: str, min_idle_seconds: int) -> Optional[str]:
         return None
 
     # 优先 unloading sleeping 的（最久空闲）
-    sleeping = [m for m in candidates if m.get("status") == "sleeping"]
+    sleeping = [m for m in candidates if _status_value(m) == "sleeping"]
     if sleeping:
         return sleeping[0]["id"]
     # 次选 status 字段为 loaded 但不活跃
     for m in candidates:
-        if m.get("status") in ("loaded",):
+        if _status_value(m) in ("loaded",):
             return m["id"]
     return None
 
@@ -150,7 +162,13 @@ def run() -> int:
     host = cfg.get("host", "127.0.0.1")
     base = f"http://127.0.0.1:{port}"
 
-    _log(f"watchdog 启动: threshold={threshold}MB, interval={interval}s, min_idle={min_idle}s, base={base}")
+    import service as _service
+    # KVMem 运行时是单槽, 没有 router 的 /models/unload 语义 —— 只监显存, 不卸载。
+    # 运行时会被 UI 切换, 所以每轮重新读一次 config。
+    can_unload = _service.serve_mode_of(cfg) != "kvmem"
+
+    _log(f"watchdog 启动: threshold={threshold}MB, interval={interval}s, "
+         f"min_idle={min_idle}s, base={base}")
 
     nvidia = shutil.which("nvidia-smi")
     if not nvidia:
@@ -163,12 +181,19 @@ def run() -> int:
     last_unload_ts = 0.0
     while True:
         try:
+            try:
+                can_unload = _service.serve_mode_of(config.load()) != "kvmem"
+            except Exception:
+                pass  # 配置正被写入时读到半截, 沿用上一轮的结论
             q = _query_nvidia_smi()
             if q is None:
                 _log("nvidia-smi 返回为空，本轮跳过")
             else:
                 free, total = q
-                if free < threshold:
+                if free < threshold and not can_unload:
+                    _log(f"显存不足 ({free}MB < {threshold}MB) 但当前是 KVMem 运行时, "
+                         f"不做 unload; 可在「⚡ KVMem」页点「切回主池」")
+                elif free < threshold:
                     # 防止短时间连续卸载
                     if time.time() - last_unload_ts < min_idle:
                         _log(f"显存不足 ({free}MB < {threshold}MB) 但在保护期内，跳过")

@@ -2,6 +2,7 @@
 
 所有方法都不抛异常给 UI，返回 (ok, message) 元组，UI 只需展示。
 """
+import json
 import os
 import shutil
 import subprocess
@@ -12,6 +13,8 @@ import config
 
 SERVICE_NAME = "llama-router"
 WATCHDOG_SERVICE_NAME = "llama-router-watchdog"
+# 旧版本给 KVMem 分支单独注册的服务名, 已与主池合并, 只在迁移时用来清掉
+LEGACY_KVMEM_SERVICE = "llama-kvmem"
 
 
 def bundled_nssm() -> str:
@@ -50,6 +53,20 @@ def out_log() -> str:
 
 def err_log() -> str:
     return os.path.join(log_dir(), "router.err.log")
+
+
+def gateway_script() -> str:
+    """网关进程脚本 (服务 llama-router 实际运行的程序)。"""
+    return os.path.join(config.app_dir(), "gateway.py")
+
+
+def gateway_out_log() -> str:
+    """网关进程自己的 stdout (后端进程的日志仍写 router.*.log)。"""
+    return os.path.join(log_dir(), "gateway.out.log")
+
+
+def gateway_err_log() -> str:
+    return os.path.join(log_dir(), "gateway.err.log")
 
 
 def _is_admin() -> bool:
@@ -102,10 +119,93 @@ def ensure_nssm() -> Tuple[bool, str]:
 
 
 def _kill_old_server() -> None:
-    subprocess.run(
-        ["taskkill", "/F", "/IM", "llama-server.exe"],
-        capture_output=True
-    )
+    """停掉所有可能占着 host:port 的服务进程 (主池 / KVMem 分支)。
+
+    外加**孤儿网关**。只靠 `nssm stop` 是不够的: 它停了服务, 但如果旧网关
+    进程没跟着退干净 (正在处理请求 / atexit 卡住), 那个进程会继续占着对外
+    端口。Windows 上两个进程可以同时 bind 同一个口 (`SO_REUSEADDR`), 于是
+    请求被随机丢给那个没人管的孤儿 —— 表现是「浏览器时好时坏 / 连不上」。
+    这里按 PID + 命令行精确认领, 绝不按镜像名杀 python.exe。
+    """
+    for img in ("llama-server.exe", "llama-kvmem-server.exe"):
+        subprocess.run(["taskkill", "/F", "/IM", img], capture_output=True)
+    _kill_old_gateways()
+
+
+def _kill_old_gateways(include_nssm_child: bool = False) -> None:
+    """结束「没人管的」gateway.py 进程。
+
+    只认领**孤儿**: 父进程已经没了、或者不是 nssm 的。服务自己拉起来的那个
+    gateway.py 父进程是 nssm.exe, 默认跳过 —— 不然这个函数会把正在正常
+    服务的进程杀掉, nssm 又按 AppExit=Restart 把它拉起来, 变成反复横跳。
+    (install() 里会先 `nssm stop` 再调它, 那时服务进程已经不算「在跑」了。)
+    """
+    script = gateway_script()
+    try:
+        import gateway as _gw
+    except Exception:                                    # noqa: BLE001
+        return
+    own = {os.getpid(), os.getppid()}
+    try:
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+             "Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" "
+             "| Select-Object ProcessId,ParentProcessId,CommandLine "
+             "| ConvertTo-Json -Compress"],
+            capture_output=True, timeout=25)
+        items = json.loads((out.stdout or b"{}").decode("utf-8", "replace")
+                           or "{}")
+    except Exception:                                    # noqa: BLE001
+        return
+    if isinstance(items, dict):
+        items = [items]
+    for it in items or []:
+        try:
+            pid = int(it.get("ProcessId"))
+        except (TypeError, ValueError):
+            continue
+        if pid in own:
+            continue
+        cmd = str(it.get("CommandLine") or "")
+        if "gateway.py" not in cmd or script.lower() not in cmd.lower():
+            continue
+        parent = 0
+        try:
+            parent = int(it.get("ParentProcessId") or 0)
+        except (TypeError, ValueError):
+            pass
+        if not include_nssm_child and parent:
+            # 父进程还在, 且不是我们(UI/python) -> 归 nssm 管, 别动
+            pname = ""
+            try:
+                p = subprocess.run(
+                    ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                     f"(Get-CimInstance Win32_Process -Filter "
+                     f"\"ProcessId={parent}\").Name"],
+                    capture_output=True, timeout=15)
+                pname = (p.stdout or b"").decode("utf-8", "replace").strip()
+            except Exception:                            # noqa: BLE001
+                pass
+            if pname and "python" not in pname.lower():
+                continue
+        subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)],
+                       capture_output=True)
+
+
+def serve_mode_of(cfg) -> str:
+    """当前运行时: "router" (主池) / "kvmem" / "strata" / "freetoken"。"""
+    mode = str((cfg or {}).get("serve_mode") or "router").strip().lower()
+    return mode if mode in ("kvmem", "strata", "freetoken") else "router"
+
+
+def gateway_base_url(cfg) -> str:
+    """网关对外的调用地址 (四组模型共用这一个口)。
+
+    绑 0.0.0.0 时这里给 127.0.0.1:本机自用最省事; 要给别的机器调用就把
+    127.0.0.1 换成这台机器的局域网 IP —— 端口不变。
+    """
+    cfg = cfg or {}
+    return f"http://127.0.0.1:{int(cfg.get('port', 18080) or 18080)}/v1"
 
 
 def _build_server_args(cfg) -> List[str]:
@@ -115,12 +215,18 @@ def _build_server_args(cfg) -> List[str]:
         "--models-max", str(cfg.get("models_max", 1)),
         "--sleep-idle-seconds", str(cfg.get("sleep_idle_seconds", 1800)),
         "--host", cfg.get("host", "0.0.0.0"),
-        "--port", str(cfg.get("port", 8080)),
+        "--port", str(cfg.get("port", 18080)),
     ]
 
 
 def install(cfg) -> Tuple[bool, str]:
-    """注册并启动 llama-router 服务。"""
+    """注册并启动 llama-router 服务 —— 服务跑的是网关 gateway.py。
+
+    网关占住 cfg.host:cfg.port, 把请求按 model 字段转给主池 (llama-server)
+    或 KVMem (llama-kvmem-server) 后端; 两个后端互斥, 切换由网关自己完成。
+    所以这一个服务对两种 serve_mode 都成立, 切换后端不用再重装服务
+    (serve_mode 仍保留为「当前活跃组」的标记, 网关切换时会回写它)。
+    """
     if not _is_admin():
         return False, need_admin_hint()
     ok, msg = ensure_nssm()
@@ -132,6 +238,10 @@ def install(cfg) -> Tuple[bool, str]:
     if not os.path.exists(exe):
         return False, f"未找到 {exe}，请先安装 llama.cpp 或修改 config.json 的 llama_dir。"
 
+    script = gateway_script()
+    if not os.path.exists(script):
+        return False, f"未找到 {script}，请重新下载完整项目。"
+
     os.makedirs(os.path.join(llama_dir, "logs"), exist_ok=True)
 
     nssm = nssm_path()
@@ -139,19 +249,25 @@ def install(cfg) -> Tuple[bool, str]:
     _kill_old_server()
     subprocess.run([nssm, "stop", SERVICE_NAME], capture_output=True)
     subprocess.run([nssm, "remove", SERVICE_NAME, "confirm"], capture_output=True)
+    # 服务已经停了, 这时任何还在跑的 gateway.py 都是「nssm 没收拾干净」留下的
+    # 孤儿 —— 它还占着对外端口, 必须清掉, 否则新服务起来会「时好时坏」。
+    _kill_old_gateways(include_nssm_child=True)
+    # 端口/服务合并后 llama-kvmem 不再单独注册, 顺手清掉旧的
+    subprocess.run([nssm, "stop", LEGACY_KVMEM_SERVICE], capture_output=True)
+    subprocess.run([nssm, "remove", LEGACY_KVMEM_SERVICE, "confirm"], capture_output=True)
 
-    args = " ".join(_build_server_args(cfg))
+    py = _python_exe()
     r = subprocess.run(
-        [nssm, "install", SERVICE_NAME, exe, args],
-        capture_output=True, text=True
+        [nssm, "install", SERVICE_NAME, py, script],
+        capture_output=True, text=True, encoding="utf-8", errors="replace"
     )
     if r.returncode != 0:
         return False, f"nssm install 失败:\n{r.stderr or r.stdout}"
 
-    out = out_log()
-    err = err_log()
+    out = gateway_out_log()
+    err = gateway_err_log()
     os.makedirs(os.path.dirname(out), exist_ok=True)
-    subprocess.run([nssm, "set", SERVICE_NAME, "AppDirectory", llama_dir], capture_output=True)
+    subprocess.run([nssm, "set", SERVICE_NAME, "AppDirectory", config.app_dir()], capture_output=True)
     subprocess.run([nssm, "set", SERVICE_NAME, "AppStdout", out], capture_output=True)
     subprocess.run([nssm, "set", SERVICE_NAME, "AppStderr", err], capture_output=True)
     subprocess.run([nssm, "set", SERVICE_NAME, "AppRotateFiles", "1"], capture_output=True)
@@ -162,10 +278,10 @@ def install(cfg) -> Tuple[bool, str]:
 
     r = subprocess.run([nssm, "start", SERVICE_NAME], capture_output=True, text=True, encoding="utf-8", errors="replace")
     if r.returncode != 0:
-        return False, f"nssm start 失败:\n{r.stderr or r.stdout}\n请查看 logs\\router.err.log"
+        return False, f"nssm start 失败:\n{r.stderr or r.stdout}\n请查看 logs\\gateway.err.log"
     # 若 watchdog 已存在，建立依赖关系
     _ensure_service_dependency()
-    return True, "服务已安装并启动"
+    return True, "服务已安装并启动 (网关)"
 
 
 def _ensure_service_dependency() -> None:
@@ -188,17 +304,19 @@ def uninstall() -> Tuple[bool, str]:
     nssm = nssm_path()
     subprocess.run([nssm, "stop", SERVICE_NAME], capture_output=True)
     subprocess.run([nssm, "remove", SERVICE_NAME, "confirm"], capture_output=True)
+    subprocess.run([nssm, "stop", LEGACY_KVMEM_SERVICE], capture_output=True)
+    subprocess.run([nssm, "remove", LEGACY_KVMEM_SERVICE, "confirm"], capture_output=True)
     return True, "服务已卸载"
 
 
-def _sc_query() -> str:
-    r = subprocess.run(["sc", "query", SERVICE_NAME], capture_output=True, text=True, encoding="utf-8", errors="replace")
+def _sc_query(name: str = SERVICE_NAME) -> str:
+    r = subprocess.run(["sc", "query", name], capture_output=True, text=True, encoding="utf-8", errors="replace")
     return r.stdout if r.returncode == 0 else ""
 
 
-def _service_state() -> str:
+def _service_state(name: str = SERVICE_NAME) -> str:
     """返回 STOPPED / RUNNING / START_PENDING / ... / NOT_INSTALLED / UNKNOWN"""
-    out = _sc_query()
+    out = _sc_query(name)
     for line in out.splitlines():
         line = line.strip()
         if line.startswith("STATE"):
@@ -208,39 +326,41 @@ def _service_state() -> str:
     return "NOT_INSTALLED" if not out else "UNKNOWN"
 
 
-def _wait_service_state(target: str, timeout: float = 10.0) -> bool:
+def _wait_service_state(target: str, timeout: float = 10.0,
+                        name: str = SERVICE_NAME) -> bool:
     """轮询服务状态直到达到 target 或超时。"""
     import time as _t
     deadline = _t.time() + timeout
     while _t.time() < deadline:
-        if _service_state() == target:
+        if _service_state(name) == target:
             return True
         _t.sleep(0.5)
     return False
 
 
-def _wait_service_not_exists(timeout: float = 5.0) -> bool:
+def _wait_service_not_exists(timeout: float = 5.0,
+                             name: str = SERVICE_NAME) -> bool:
     """轮询直到服务被完全删除。"""
     import time as _t
     deadline = _t.time() + timeout
     while _t.time() < deadline:
-        if _service_state() == "NOT_INSTALLED":
+        if _service_state(name) == "NOT_INSTALLED":
             return True
         _t.sleep(0.3)
     return False
 
 
-def start() -> Tuple[bool, str]:
+def start(name: str = SERVICE_NAME, log_hint: str = "") -> Tuple[bool, str]:
     if not _is_admin():
         return False, need_admin_hint()
-    state = _service_state()
+    state = _service_state(name)
     if state == "NOT_INSTALLED":
         return False, "服务未安装，请先点击「安装服务」"
     if state in ("RUNNING", "START_PENDING"):
         return True, f"服务已在运行 (当前状态: {state})"
     last_err = ""
     for attempt in (1, 2):
-        r = subprocess.run(["sc", "start", SERVICE_NAME], capture_output=True, text=True, encoding="utf-8", errors="replace")
+        r = subprocess.run(["sc", "start", name], capture_output=True, text=True, encoding="utf-8", errors="replace")
         if r.returncode == 0:
             break
         last_err = (r.stderr or r.stdout or "").strip()
@@ -251,18 +371,18 @@ def start() -> Tuple[bool, str]:
         break
     if r.returncode != 0:
         if not last_err:
-            last_err = f"sc 未返回错误详情，请查看 {err_log()}"
+            last_err = f"sc 未返回错误详情，请查看 {log_hint or err_log()}"
         return False, f"启动失败 (当前状态 {state}): {last_err}"
     return True, "已启动"
 
 
-def stop() -> Tuple[bool, str]:
+def stop(name: str = SERVICE_NAME) -> Tuple[bool, str]:
     if not _is_admin():
         return False, need_admin_hint()
-    state = _service_state()
+    state = _service_state(name)
     if state in ("STOPPED", "STOP_PENDING", "NOT_INSTALLED"):
         return True, f"服务已停止 (当前状态: {state})"
-    r = subprocess.run(["sc", "stop", SERVICE_NAME], capture_output=True, text=True, encoding="utf-8", errors="replace")
+    r = subprocess.run(["sc", "stop", name], capture_output=True, text=True, encoding="utf-8", errors="replace")
     if r.returncode != 0:
         err = (r.stderr or r.stdout or "").strip()
         if not err:
@@ -271,36 +391,36 @@ def stop() -> Tuple[bool, str]:
     return True, "已停止"
 
 
-def restart() -> Tuple[bool, str]:
+def restart(name: str = SERVICE_NAME, log_hint: str = "") -> Tuple[bool, str]:
     if not _is_admin():
         return False, need_admin_hint()
-    state = _service_state()
+    state = _service_state(name)
     if state == "NOT_INSTALLED":
         return False, "服务未安装，请先点击「安装服务」"
-    subprocess.run(["sc", "stop", SERVICE_NAME], capture_output=True)
+    subprocess.run(["sc", "stop", name], capture_output=True)
     # 等真正停止，最多 15 秒
     for _ in range(15):
-        if _service_state() == "STOPPED":
+        if _service_state(name) == "STOPPED":
             break
         import time
         time.sleep(1)
-    r = subprocess.run(["sc", "start", SERVICE_NAME], capture_output=True, text=True, encoding="utf-8", errors="replace")
+    r = subprocess.run(["sc", "start", name], capture_output=True, text=True, encoding="utf-8", errors="replace")
     if r.returncode != 0:
         err = (r.stderr or r.stdout or "").strip()
         if not err:
-            err = "sc 未返回错误详情，请查看 logs\\router.err.log"
+            err = f"sc 未返回错误详情，请查看 {log_hint or 'logs\\\\router.err.log'}"
         return False, f"重启失败: {err}"
     return True, "已重启"
 
 
-def is_installed() -> bool:
-    r = subprocess.run(["sc", "query", SERVICE_NAME], capture_output=True, text=True, encoding="utf-8", errors="replace")
+def is_installed(name: str = SERVICE_NAME) -> bool:
+    r = subprocess.run(["sc", "query", name], capture_output=True, text=True, encoding="utf-8", errors="replace")
     return r.returncode == 0
 
 
-def status() -> str:
+def status(name: str = SERVICE_NAME) -> str:
     """返回服务状态文本，未安装返回 'NOT_INSTALLED'。"""
-    return _service_state()
+    return _service_state(name)
 
 
 def install_bat_cmd() -> str:
@@ -310,7 +430,10 @@ def install_bat_cmd() -> str:
 
 
 def run_foreground(cfg) -> Tuple[bool, str]:
-    """前台运行 llama-server.exe（用于测试）。返回是否启动成功。"""
+    """前台运行当前运行时的 exe (用于测试)。返回是否启动成功。"""
+    if serve_mode_of(cfg) == "kvmem":
+        import kvmem as _kvmem
+        return _kvmem.run_foreground(cfg)
     llama_dir = cfg["llama_dir"].rstrip("\\/")
     exe = os.path.join(llama_dir, "llama-server.exe")
     if not os.path.exists(exe):

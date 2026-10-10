@@ -58,7 +58,7 @@ def _kv_lines(scope: str, params: Dict[str, Any],
     # 用户额外参数中可能 schema 没记录 (防御性)
     known_meta = {p["key"] for p in _all_params_meta()}
     for k, node in params.items():
-        if k in known_meta or k in skip_keys:
+        if k in known_meta or k in skip_keys or k in config.REMOVED_PARAM_KEYS:
             continue
         val = wanted(k, node)
         if val:
@@ -84,6 +84,13 @@ def render(cfg: Dict[str, Any], known: Optional[Set[str]] = None,
 
     for m in cfg.get("models", []):
         if not m.get("enabled", True):
+            continue
+        # KVMem / Strata / FreeToken 档位走各自独立的引擎进程, 不进主路由的池子。
+        # 主 llama-server (b11200) 不认识 --kvmem-*, 写进来会让整个
+        # router-preset.ini 解析失败 -> 所有模型都加载不了。这道闸门是硬防线。
+        # (Strata / FreeToken 更是完全不吃 llama flag: 前者参数在 strata-*.json 里,
+        #  后者的模型根本是目录。)
+        if m.get("runtime") in ("kvmem", "strata", "freetoken"):
             continue
         mid = m.get("id", "").strip()
         if not mid:

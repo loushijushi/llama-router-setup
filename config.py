@@ -123,8 +123,9 @@ PARAM_SCHEMA: List[Dict[str, Any]] = [
           description=_D("通过 KV shifting 复用 prompt cache 的最小块大小。")),
     Param("kv-unified", "统一 KV 缓冲", "true", kind="bool", scope="both", category="advanced",
           description=_D("使用跨 slot 共享的统一 KV buffer。")),
-    Param("no-mmap", "禁用内存映射", "false", kind="bool", scope="both", category="advanced",
-          description=_D("默认开启 mmap 加快加载。设为 true 时不映射。")),
+    # 注意: 旧的 no-mmap (--no-mmap) 在新版 llama-server 里已不存在,
+    # 等价替代是 load-mode (auto/none/mmap/mlock/mmap+mlock/dio)。
+    # 见 REMOVED_PARAM_KEYS / _migrate_param_keys() 的迁移。
     # ============== 注意力 / RoPE ==============
     Param("flash-attn", "Flash Attention", "on", kind="choice", scope="both", category="common",
           hint="on / off / auto",
@@ -291,6 +292,10 @@ PARAM_SCHEMA: List[Dict[str, Any]] = [
     Param("context-shift", "上下文位移", "false", kind="bool", scope="both", category="advanced",
           description=_D("无限生成时是否自动位移上下文。")),
     # ============== 多模态 ==============
+    Param("mmproj-auto", "自动加载 mmproj", "true", kind="bool", scope="model", category="common",
+          hint="不勾=不写入, 沿用 llama 默认(自动加载)",
+          description=_D("llama-server: --mmproj-auto / --no-mmproj-auto。\n"
+                         "启动时自动按 mmproj 路径加载视觉投影；没有 mmproj 路径时该项无作用。")),
     Param("mmproj-offload", "mmproj 卸载到 GPU", "true", kind="bool", scope="model", category="common",
           description=_D("视觉模型的 mmproj 投影文件是否放到 GPU。")),
     Param("mmproj-device", "mmproj 设备", "", kind="text", scope="model", category="advanced",
@@ -374,9 +379,86 @@ PARAM_SCHEMA: List[Dict[str, Any]] = [
           description=_D("开启 reranking 端点。")),
     Param("webui", "启用 Web UI", "true", kind="bool", scope="global", category="advanced",
           description=_D("内置 Web 聊天界面。")),
+    # ============== KVMem 分支 (llama-kvmem-server) ==============
+    # scope="kvmem": 只在「⚡ KVMem」页的参数面板里出现, 不进全局页, 也
+    # 不进主路由的 router-preset.ini —— 主 llama-server (b11200) 不认识
+    # --kvmem-* 这些 flag, 写进去会让整个 preset 解析失败、所有模型都加载不了。
+    # generate_preset.render() 里另有 runtime 闸门做兜底。
+    Param("kvmem", "启用 KVMem", "true", kind="bool", scope="kvmem", category="common",
+          description=_D("KVMem 分支总开关 (--kvmem / --no-kvmem)。\n"
+                         "关掉就退化成普通单槽 llama.cpp。")),
+    Param("kvmem-budget", "KVMem 预算 (token)", "24576", kind="int", scope="kvmem", category="common",
+          hint="0 = 用满整段 ctx",
+          description=_D("GPU 工作集 token 数 (--kvmem-budget)。\n"
+                         "越大越占显存, 但长文/长上下文越不容易掉出去。")),
+    Param("kvmem-gen-reserve", "生成预留 (token)", "12288", kind="int", scope="kvmem", category="common",
+          description=_D("decode 阶段预留的余量 (--kvmem-gen-reserve)。\n"
+                         "留得越少越省显存, 但太小会让生成变慢或失败。")),
+    Param("kvmem-block-tokens", "分块大小 (token)", "128", kind="int", scope="kvmem", category="advanced",
+          description=_D("KVMem 分块粒度 (--kvmem-block-tokens)。")),
+    Param("kvmem-gpu-ratio", "slot pool 显存占比", "0.50", kind="text", scope="kvmem",
+          category="advanced",
+          description=_D("slot pool 上限占 GPU 显存的份额 (--kvmem-gpu-ratio)。\n"
+                         "默认值 0.50 是保守值; 显存有余时可以调高,\n"
+                         "让更多 KV 块留在显存里, 长上下文更快。")),
+    Param("kvmem-cpu-gb", "CPU 溢出区 (GiB)", "0", kind="int", scope="kvmem",
+          category="advanced",
+          hint="0 = 关闭",
+          description=_D("CPU 溢出区大小 (--kvmem-cpu-gb)。\n"
+                         "默认 0 = 关闭 —— 关着就没有 CPU 侧承接,\n"
+                         "超出显存的 KV 只能整个失败。\n"
+                         "物理内存够就开大, 长上下文才撑得住。")),
+    Param("kvmem-nvme-gb", "NVMe 溢出区 (GiB)", "0", kind="int", scope="kvmem",
+          category="advanced",
+          hint="0 = 关闭",
+          description=_D("NVMe 溢出区大小 (--kvmem-nvme-gb)。\n"
+                         "比 CPU 区慢, 但容量便宜; 超长上下文兜底用。")),
+    Param("kvmem-sink-tokens", "常驻前缀 (token)", "0", kind="int", scope="kvmem",
+          category="advanced",
+          hint="0 = 一个块",
+          description=_D("永远保留的前缀 (--kvmem-sink-tokens)。\n"
+                         "系统提示放这里, 长对话里不会被挤掉导致跑题。")),
+    Param("kvmem-recent-tokens", "常驻近期 (token)", "0", kind="int", scope="kvmem",
+          category="advanced",
+          hint="0 = 不保留",
+          description=_D("永远保留的最近后缀 (--kvmem-recent-tokens)。\n"
+                         "保证刚才说过的话在任何淘汰策略下都不丢。")),
+    Param("kvmem-query-max-tokens", "检索 query 上限", "0", kind="int", scope="kvmem",
+          category="advanced",
+          hint="0 = 不限",
+          description=_D("检索 query 截断上限 (--kvmem-query-max-tokens)。\n"
+                         "太小会让超长问题检索偏题。")),
+    Param("kvmem-query-policy", "检索查询策略", "user", kind="choice", scope="kvmem", category="advanced",
+          description=_D("检索 query来源 (--kvmem-query-policy):\n"
+                         "user = 只拿最后一条用户消息当 query (推荐);\n"
+                         "legacy = 旧行为。")),
+    Param("kvmem-method", "KVMem 淘汰算法", "retrieval", kind="choice", scope="kvmem", category="advanced",
+          description=_D("--kvmem-method: retrieval 按相关性挑要保留的块,\n"
+                         "recency 按新近度保留。")),
+    Param("enable-thinking", "开启思考", "false", kind="bool", scope="kvmem", category="common",
+          description=_D("强制打开思维链 (--enable-thinking)。\n"
+                         "配合「思维预算」(reasoning-budget) 使用, 预算 0 = 不思考。")),
+    Param("ui-dir", "自定义 UI 目录", r"..\share\kvmem\ui", kind="text", scope="kvmem", category="advanced",
+          hint="相对 bin 目录",
+          description=_D("--ui-dir: 静态聊天界面目录。--webui 始终开启。")),
+    Param("verbosity", "日志详细度", "3", kind="int", scope="kvmem", category="advanced",
+          description=_D("--verbosity: 0~5, 越大日志越多。")),
 ]
 
 SCHEMA_INDEX: Dict[str, Dict[str, Any]] = {p["key"]: p for p in PARAM_SCHEMA}
+
+# runtime 字段取值: 空串 = 走主路由 llama-server (b11200) 的模型池;
+# "kvmem" = 走 llama-kvmem-server 分支, 只由「⚡ KVMem」页托管。
+# "strata" = 走 Strata 分支 (C:\Strata, 自带 OpenAI 兼容服务),
+# 只由「🌐 Strata」页托管; 它的参数全在 strata-<档位>.json 里, 不吃 llama flag。
+# "freetoken" = 走 FreeToken 分支 (freetoken pip 包, 自带 OpenAI + Anthropic
+# 兼容服务 `ft serve`), 只由「⚡ FreeToken」页托管; 模型是**目录**, 参数是
+# FreeToken 自己的 flag, 同样不吃 llama flag。
+KVMEM_RUNTIME = "kvmem"
+STRATA_RUNTIME = "strata"
+FREETOKEN_RUNTIME = "freetoken"
+
+KVMEM_SCOPED_KEYS = frozenset(p["key"] for p in PARAM_SCHEMA if p["scope"] == "kvmem")
 
 # 「推测解码」草稿面板 (draft_box) 专属的 key: 面板里已有控件,
 # 不在模型参数子表里重复出现 (子表那份会被 draft_* 顶层字段覆盖, 属于静默失效)。
@@ -410,6 +492,25 @@ DRAFT_QUICK_KEYS = frozenset({
     "spec-draft-p-split", "spec-draft-p-min", "spec-draft-ngl",
 })
 
+# 「视觉模型 / KV 内存加载」独立区块 (模型页右侧面板顶部) 专属的 key。
+# 和 DRAFT_BOX_KEYS 同理: 区块里已有控件, 不在模型参数子表里重复出现。
+# 顺序即渲染顺序, 分三组显示。
+MMKV_VISION_KEYS = (
+    "mmproj-auto", "mmproj-offload", "mmproj-device",
+    "image-min-tokens", "image-max-tokens", "mtmd-batch-max-tokens",
+)
+MMKV_KV_KEYS = (
+    "kv-offload", "kv-unified", "cache-ram",
+    "cache-type-k", "cache-type-v",
+)
+MMKV_LOAD_KEYS = (
+    "load-mode",
+)
+MMKV_BOX_KEYS = frozenset(MMKV_VISION_KEYS + MMKV_KV_KEYS + MMKV_LOAD_KEYS)
+
+# schema 里已删除的 key -> 加载时从用户 params 里清掉 (否则会留在配置里当垃圾)。
+REMOVED_PARAM_KEYS = frozenset({"no-mmap"})
+
 # 旧版 schema 里写错的 key -> llama-server 真正认识的 key。
 # 错的 key 会让整个 router-preset.ini 解析失败 (所有模型都加载不了)，故加载时自动迁移。
 PARAM_KEY_ALIASES = {
@@ -433,6 +534,17 @@ def _default_prefs() -> Dict[str, Any]:
             "reasoning", "chat-template", "mmproj-offload",
         ],
         "extra_params": [],
+        # 「⚡ KVMem」页参数面板里当「常用」显示的 key (其余进「扩展参数」折叠区)。
+        # 注意 cache-type-k/v、mmproj-offload 这些在「模型」页的独立区块里已有一份,
+        # 这里刻意不列 —— 同一条记录的同一个 key 全项目只出现一次。
+        "kvmem_common_keys": [
+            "kvmem-budget", "kvmem-gen-reserve", "enable-thinking",
+            "reasoning-budget", "ctx-size", "parallel", "jinja",
+        ],
+        # 监控窗口「监控地址」下拉里出现过的地址 (最近的在最前)
+        "monitor_addr_history": [],
+        # 上面最多留几条 (1..50)
+        "monitor_addr_history_max": 10,
     }
 
 
@@ -446,7 +558,44 @@ def load_prefs() -> Dict[str, Any]:
     base.update(data)
     if not isinstance(base.get("extra_params"), list):
         base["extra_params"] = []
+    if not isinstance(base.get("kvmem_common_keys"), list):
+        base["kvmem_common_keys"] = list(
+            _default_prefs()["kvmem_common_keys"])
+    base["monitor_addr_history_max"] = _clean_addr_history_max(
+        base.get("monitor_addr_history_max"))
+    base["monitor_addr_history"] = _clean_addr_history(
+        base.get("monitor_addr_history"), base["monitor_addr_history_max"])
     return base
+
+
+def _clean_addr_history_max(value: Any) -> int:
+    """历史条数上限: 必须是 1..50 的整数, 否则回落默认 10。"""
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return 10
+    return min(50, max(1, n))
+
+
+def _clean_addr_history(value: Any, limit: int) -> List[str]:
+    """历史记录: 只留非空字符串、去重 (靠前的优先)、按上限截断。
+
+    非字符串 (数字/null) 直接丢掉 —— 手编 user_preferences.json 时很容易
+    写成 [123, null], 转成 "123"/"None" 会污染下拉框。
+    """
+    if not isinstance(value, list):
+        return []
+    out: List[str] = []
+    for item in value:
+        if not isinstance(item, str):
+            continue
+        s = item.strip()
+        if not s or s in out:
+            continue
+        out.append(s)
+        if len(out) >= limit:
+            break
+    return out
 
 
 def save_prefs(prefs: Dict[str, Any]) -> None:
@@ -458,8 +607,21 @@ def common_keys() -> List[str]:
     return list(load_prefs().get("common_keys", []))
 
 
+def kvmem_common_keys() -> List[str]:
+    """「⚡ KVMem」参数面板里当常用显示的 key。"""
+    keys = load_prefs().get("kvmem_common_keys")
+    if not isinstance(keys, list):
+        return list(_default_prefs()["kvmem_common_keys"])
+    return [k for k in keys if isinstance(k, str)]
+
+
 def extra_params() -> List[Dict[str, Any]]:
     return list(load_prefs().get("extra_params", []))
+
+
+def all_params_meta() -> List[Dict[str, Any]]:
+    """内置 schema + 用户额外参数 (bat 导入的冷门 flag 会落在后者)。"""
+    return list(PARAM_SCHEMA) + list(extra_params())
 
 
 def all_known_keys() -> List[str]:
@@ -472,7 +634,14 @@ def all_known_keys() -> List[str]:
 DEFAULT_CONFIG: Dict[str, Any] = {
     "llama_dir": r"C:\llama.cpp",
     "host": "0.0.0.0",
-    "port": 8080,
+    # **对外端口 = 网关自己的口**。刻意避开 8080: 那是 llama-server 和
+    # Strata 的原生默认端口, 谁先起谁占, 于是「换个端口」这种配置就只能去
+    # 改别人软件的端口。网关让开, 三个后端就能各用各的原生端口。
+    # 远程客户端连的是这个口 (http://<本机IP>:18080/v1)。
+    "port": 18080,
+    # 当前运行时: 只有一个 Windows 服务 llama-router, 装它就等于装网关。
+    # 网关按请求里的 model 字段转给主池 / KVMem / Strata 其中一组。
+    "serve_mode": "router",
     "models_max": 1,
     "sleep_idle_seconds": 3600,
     "watchdog": {
@@ -480,6 +649,143 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "free_mb_threshold": 2048,
         "check_interval_seconds": 10,
         "min_idle_seconds": 0,
+    },
+    # 模型自动换挡 (LRU): 新请求要加载的模型不在常驻列表里、
+    # 而最旧的常驻模型正在被使用时, 按 busy_policy 处理。
+    #   ask  -> GUI 弹窗让用户选 (无 GUI 自动降级为 wait)
+    #   wait -> 等它用完再自动卸载
+    #   now  -> 立即卸载
+    "model_guard": {
+        "enabled": True,
+        "poll_interval_seconds": 1,
+        "wanted_ttl_seconds": 30,
+        "busy_policy": "ask",
+    },
+    # 日志转发: llama-server 没有日志类 HTTP 接口, 远程监控想看到和本地一样的
+    # 日志面板, 只能由本机把 logs\\router.*.log 只读地转发出去 (默认关闭)。
+    "log_relay": {
+        "enabled": False,
+        "port": 8099,
+    },
+    # KVMem 分支 (llama-kvmem-server): 单槽独立进程, 不进 router-preset.ini。
+    #   install_dir/exe 留空 -> 运行时在 install_dir 下自动探测
+    #     llama-kvmem-server.exe (不写死版本号, 换包不用改配置)。
+    #   host/port 已废弃 (与主池统一): 运行时一律读顶层的 host/port。
+    #   保留字段只为兼容老配置, 服务不再读它们, 档位的 kvmem_port 字段同理。
+    # 网关 (gateway.py): 服务 llama-router 的进程本体, 占住顶层 host/port,
+    # 按请求里的 model 字段把流量转给主池 / KVMem / Strata 后端。
+    #   backend_port: **三个后端共用的内部口**。它们本来就互斥(同一时刻只跑
+    #     一个), 所以没必要各占一个 —— 共用之后谁都能用各自的原生默认端口
+    #     (llama.cpp / Strata 都是 8080), 不用为了接入网关去改它们的端口。
+    #     Strata 更特殊: 它只认命令行 --port, 自己 json 里的 port 不参与
+    #     绑定, 所以它用自己那份配置写的值 (照它的 run-*.bat)。
+    #   ready_timeout: 切换时等后端 /health 返回 200 的秒数 (含模型加载);
+    #   Strata 另用自己的 strata.ready_timeout (它要 1-3 分钟)。
+    #   inflight_grace: 停旧后端前等在途请求收尾的秒数。
+    #   preload: **默认 false = 按需加载** —— 服务起来不加载任何模型, 收到
+    #     带 model 的请求才把那一组拉起来 (Strata 那样 40GB 的模型不会被
+    #     一开机就拖进内存)。true = 开机就按 serve_mode 起好, 第一个请求
+    #     不用等加载。
+    "gateway": {
+        "backend_port": 8080,
+        "ready_timeout": 300,
+        "inflight_grace": 120,
+        # --- GPU 忙碌判据 (切档前等占着内部口的那个模型腾出显存) ---
+        # 判据是「显存 + GPU 利用率」双重, 不是在途请求数 —— 正在对话但此刻
+        # 没有活跃请求的模型, 在「在途请求」眼里是空闲的, 会被误杀。
+        # 显存: 掉够这个比例就算对方主动关了 -> 立刻可切
+        "vram_drop_ratio": 0.5,
+        # GPU 利用率低于这个值算空闲 (刻意放宽, 采样会抖)
+        "gpu_idle_pct": 20,
+        # 连续几次采样都空闲才认 (防抖), 每次间隔 gpu_sample_seconds
+        "gpu_idle_samples": 3,
+        "gpu_sample_seconds": 5,
+        # 显存还在、但 GPU 空闲满这么久 -> 到点自动切
+        "gpu_idle_grace": 300,
+        "preload": False,
+    },
+    "kvmem": {
+        "enabled": True,
+        "install_dir": r"C:\llama.cpp\kvmem-llama.cpp",
+        "exe": "",
+        "host": "127.0.0.1",
+        "port": 18200,
+        "active_id": "",
+        # 对应 bat 里的 set CUDA_VISIBLE_DEVICES=0 / CUDA_DEVICE_ORDER=PCI_BUS_ID
+        "cuda_device": "0",
+        "cuda_device_order": "PCI_BUS_ID",
+    },
+    # Strata 分支 (C:\Strata): 自带 OpenAI 兼容服务 serve/server.py,
+    # 引擎参数全在 strata-<档位>.json 里 (模型条目的 strata_config 指向它)。
+    "strata": {
+        "enabled": True,
+        "install_dir": r"C:\Strata",
+        "python": "",          # 留空 -> 自动用 <install_dir>\.venv\Scripts\python.exe
+        "server": "",          # 留空 -> 自动用 <install_dir>\serve\server.py
+        "active_id": "",
+        # 35-55GB 拉到内存要 1-3 分钟, 别拿主池那 300s 去卡它
+        "ready_timeout": 900,
+        "lazy": False,         # True = 进程先起、模型等第一次请求再加载
+        "api_monitor": False,
+        "gpu": "",
+        "api_key": "",         # 留空 = 后端不鉴权 (它只绑回环, 对外靠网关)
+    },
+    # FreeToken 分支 (freetoken pip 包, 自带 OpenAI + Anthropic 兼容的
+    # `ft serve`): 模型是**目录**, 引擎参数是 FreeToken 自己的 flag
+    # (模型条目的 freetoken_args), 不吃 llama flag。
+    "freetoken": {
+        "enabled": True,
+        "install_dir": "",     # 留空 -> %LOCALAPPDATA%\FreeToken
+        "models_dir": r"D:\AI\freetoken\models",
+        "python": "",          # 留空 -> 自动用 <install_dir>\venv\Scripts\python.exe
+        "desktop_exe": "",     # 留空 -> 自动找 "FreeToken Desktop\freetoken-desktop.exe"
+        "active_id": "",
+        # 从零加载要把权重搬进显存, 冷启动可能好几分钟
+        "ready_timeout": 600,
+        # 下面三个**默认都不动 FreeToken 的显存分配**。
+        #
+        # 原则: FreeToken 的参数归 FreeToken 桌面版管, 网关不越权改。引擎的
+        # KV / MoE 分配是 FreeToken 自己按显存预算策略算出来的, 你在它界面里
+        # 怎么设就怎么跑。
+        #
+        # 网关**曾经**在引擎就绪后自动调 POST /v1/cache/rebuild 把 KV 顶大
+        # (因为启动时只自动给一点点 KV, 实测 8196 页 = 8196 token, 剩下的预算
+        # 全给了 MoE 专家缓存, 长对话会被**整条丢掉**:
+        #   WARNING Input sequence length 49016 exceeds 8196, request 0 is dropped.)
+        # 但那是**越权**: 顶满 KV 会把 MoE 专家缓存挤掉, 实测专家缓存从 4681
+        # 掉到 1430, **解码速度直接腰斩** (nvidia-smi 只剩 ~1.3GB 余量)。
+        # 所以网关**不碰** FreeToken 的缓存池 —— 它有自己的一套弹性内存管理
+        # (专家缓存与 KV 之间运行时重分配)。网关只读 /v1/cache/status 展示;
+        # 要调就写 freetoken.extra_args, 原样透传给 FreeToken。
+        #
+        # daemon 控制面 (ft daemon): 网关**经它**起停 engine, 这样 FreeToken
+        # 桌面版才能看见调用 (桌面版只认它自己那个 daemon; 网关自己 spawn 的
+        # engine 对它完全不存在, 实测 daemon 状态一直是 running:false)。
+        # 桌面版实际用 19000, 上游默认 1900; 留空 -> 先试 19000 再试 1900。
+        # 引擎端口 / 控制面端口: **FT 自己的约定, 网关不改**。
+        # 官方默认 (freetoken/daemon/server.py):
+        #     DEFAULT_PORT       = 1900  控制面
+        #     DEFAULT_SERVE_PORT = 1919  引擎
+        # 以前网关强行把引擎塞到 gateway.backend_port (8080), 结果桌面版按
+        # 1919 去找, 找不到 -> 永远「正在加载中」。
+        "port": 1919,
+        "daemon_port": 1900,
+        # state-dir: daemon 的锁/pidfile/serve.json/engine 日志都在这下面。
+        # 留空 -> 探测桌面版那份 (<用户profile>\.freetoken\daemon), 自启
+        # daemon 时也用它, 这样引擎日志位置可预期。
+        "state_dir": "",
+        # 桌面版没开时, 网关自己拉一个 daemon (按需加载仍然不加载模型,
+        # 只是把控制面备着)。关掉 = 桌面版没开就完全用不了这一组。
+        "autostart_daemon": True,
+        # 兜底附加参数 (字符串, 原样拆成 argv); 档位条目自己的
+        # freetoken_args 优先。默认留空 —— FT 有自己的一套弹性调度
+        # (README: Elastic Memory Management), 网关不替它选调度参数。
+        "extra_args": "",
+        # 告诉客户端 (Hermes 等) 最多能发多长。**这是网关对外的承诺上限,
+        # 不是让网关去分配显存** —— FT 实际 KV 由用户在 FT 控制面板里调,
+        # 网关只读 /v1/stats 压一道保险 (见 gateway._cap_context_to_kv)。
+        # 0 = 不设上限, 只报引擎实际值。
+        "kv_target": 262144,
     },
     "models": [],
 }
@@ -507,6 +813,18 @@ def _merge_defaults(data: Dict[str, Any]) -> Dict[str, Any]:
             out["models"] = [_normalize_model(m) for m in v]
         elif k == "watchdog" and isinstance(v, dict):
             out["watchdog"].update(v)
+        elif k == "model_guard" and isinstance(v, dict):
+            out["model_guard"].update(v)
+        elif k == "log_relay" and isinstance(v, dict):
+            out["log_relay"].update(v)
+        elif k == "gateway" and isinstance(v, dict):
+            out["gateway"].update(v)
+        elif k == "kvmem" and isinstance(v, dict):
+            out["kvmem"].update(v)
+        elif k == "strata" and isinstance(v, dict):
+            out["strata"].update(v)
+        elif k == "freetoken" and isinstance(v, dict):
+            out["freetoken"].update(v)
         else:
             out[k] = v
     for m in out["models"]:
@@ -534,6 +852,25 @@ def _migrate_param_keys(params: Dict[str, Any]) -> None:
             params.pop(old, None)
         else:
             params[new] = params.pop(old)
+    _drop_removed_params(params)
+
+
+def _drop_removed_params(params: Dict[str, Any]) -> None:
+    """清掉 schema 里已删除的 key (幂等)。
+
+    no-mmap (--no-mmap) 在新版 llama-server 里已经不存在了, 等价设置是
+    load-mode = none。只有在旧配置确实打开过 no-mmap 且 load-mode 没被
+    用户单独设过时才迁移, 否则直接丢弃。
+    """
+    node = params.pop("no-mmap", None)
+    if not isinstance(node, dict) or not node.get("enabled"):
+        return
+    if str(node.get("value") or "").strip().lower() not in ("true", "1", "yes", "on"):
+        return
+    cur = params.get("load-mode")
+    if isinstance(cur, dict) and cur.get("enabled"):
+        return
+    params["load-mode"] = {"enabled": True, "value": "none"}
 
 
 def _normalize_model(m: Dict[str, Any]) -> Dict[str, Any]:
@@ -552,6 +889,21 @@ def _normalize_model(m: Dict[str, Any]) -> Dict[str, Any]:
     base.setdefault("draft_n_min", "0")
     base.setdefault("draft_p_split", "0.1")
     base.setdefault("draft_p_min", "0.0")
+    # 运行时归属: "" = 主路由 (llama-server) 模型池;
+    # "kvmem" = llama-kvmem-server 分支, 只由「⚡ KVMem」页托管。
+    # "strata" = Strata 分支, 只由「🌐 Strata」页托管。
+    # "freetoken" = FreeToken 分支, 只由「⚡ FreeToken」页托管。
+    base.setdefault("runtime", "")
+    # Strata 档位指向自己的引擎配置 json (参数都在那个文件里, 不走 params)
+    if base.get("runtime") == STRATA_RUNTIME:
+        base.setdefault("strata_config", "")
+    # FreeToken 档位指向模型**目录**, 附加参数是一个原样拆成 argv 的字符串
+    if base.get("runtime") == FREETOKEN_RUNTIME:
+        base.setdefault("freetoken_model", "")
+        base.setdefault("freetoken_args", "")
+    # 档位端口 (已废弃): 与主池统一用顶层 port, 运行时不再读这个字段。
+    # 保留只为兼容老配置和 bat 导入留痕。
+    base.setdefault("kvmem_port", "")
     base["params"] = base.get("params", {}) or {}
     _migrate_param_keys(base["params"])
     # 快捷字段勾选状态: 老配置没有该字段 -> 默认全勾 (等价于旧行为: 开关开着就写)
@@ -575,16 +927,42 @@ def _ensure_model_params(m: Dict[str, Any]) -> None:
     """
     params = m.setdefault("params", {})
     _migrate_param_keys(params)
+    if m.get("runtime") == STRATA_RUNTIME:
+        # Strata 档位的参数全在 strata-<档位>.json 里 (serve/server.py 传给
+        # strata.exe 的是那个 args 数组), 一个 llama flag 都不吃。
+        # 这里补出来的几百个 llama 参数只会让人误以为改了能生效, 所以清空。
+        params.clear()
+        return
+    if m.get("runtime") == FREETOKEN_RUNTIME:
+        # 同理: FreeToken 吃的是它自己的 flag (--moe-backend / --memory-ratio
+        # ...), 写在档位条目的 freetoken_args 里。补 llama 参数纯属误导。
+        params.clear()
+        return
+    # kvmem 专属参数只给 kvmem 档位补齐 —— 主池模型不需要, 写了也用不上
+    kvmem_only = m.get("runtime") == KVMEM_RUNTIME
+    kvmem_common = set(kvmem_common_keys())
     for p in PARAM_SCHEMA:
-        if p["scope"] not in ("model", "both"):
+        if p["scope"] == "kvmem":
+            if not kvmem_only:
+                continue
+            # kvmem 常用项默认勾上, 否则 9 项全要手动勾一遍
+            enabled, default = p["key"] in kvmem_common, p["default"]
+        elif p["scope"] in ("model", "both"):
+            enabled, default = _default_enabled(p["key"]), p["default"]
+        else:
             continue
         if p["key"] not in params:
-            params[p["key"]] = {
-                "enabled": _default_enabled(p["key"]),
-                "value": p["default"],
-            }
+            params[p["key"]] = {"enabled": enabled, "value": default}
     for p in extra_params():
-        if p.get("scope", "model") not in ("model", "both", "global"):
+        scope = p.get("scope", "model")
+        if scope == "kvmem":
+            # kvmem 专属的额外参数 (bat 导入的冷门 flag) 只给 kvmem 档位
+            if not kvmem_only:
+                continue
+        elif scope not in ("model", "both", "global"):
+            continue
+        elif kvmem_only and scope == "model":
+            # 主池专属的额外参数不该塞进 kvmem 档位 (kvmem 面板也看不到它)
             continue
         if p["key"] not in params:
             params[p["key"]] = {
@@ -630,6 +1008,8 @@ def list_kinds_choices() -> Dict[str, List[str]]:
             "ngram-mod", "ngram-cache", "none",
         ],
         "spec-draft-ngl": ["auto", "0", "99"],
+        "kvmem-query-policy": ["legacy", "user"],
+        "kvmem-method": ["recency", "retrieval"],
     }
 
 

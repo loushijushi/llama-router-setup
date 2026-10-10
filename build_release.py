@@ -132,6 +132,11 @@ def verify_zip_privacy(zip_path: Path, project_root: Path = None) -> list:
     return violations
 
 
+# 产品 / runtime 名。这些词是本项目的公共词汇, 代码里到处都是 (kvmem.py、
+# ui.py、启动脚本……), 把它们当"本机私有信息"去扫会全量误报。
+GENERIC_NAMES = {"kvmem", "strata", "router", "pool", "draft", "mmkv", "kv"}
+
+
 def _private_markers(project_root: Path) -> list:
     """从本机 config.json 提取有辨识度的字符串, 用于反泄漏扫描。"""
     import json
@@ -163,6 +168,10 @@ def _private_markers(project_root: Path) -> list:
     # 去重 + 过滤掉太短/太通用的
     seen, out = set(), []
     for s in markers:
+        low = s.strip().lower()
+        # 产品名派生的档位名 (kvmem / kvmem-XX / ...) 同样不是本机信息
+        if any(low.startswith(g) for g in GENERIC_NAMES):
+            continue
         if len(s) < 4 or s in seen:
             continue
         seen.add(s)

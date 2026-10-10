@@ -42,6 +42,10 @@ def git(*args) -> tuple:
     return run(["git", "-C", str(PROJECT_ROOT)] + list(args))
 
 
+# 产品 / runtime 名。见 build_release.GENERIC_NAMES —— 两处必须一致。
+GENERIC_NAMES = {"kvmem", "strata", "router", "pool", "draft", "mmkv", "kv"}
+
+
 def private_markers() -> list:
     """从本机 config.json 提取有辨识度的标识 (模型路径 / 模型名 / api_key)。
 
@@ -65,6 +69,11 @@ def private_markers() -> list:
             found.append(m.replace("\\", "/"))
     seen, out = set(), []
     for s in found:
+        low = s.strip().lower()
+        # 产品 / runtime 名及其派生档位名 (kvmem / kvmem-XX / ...) 是本项目的
+        # 公共词汇, 代码与文档里到处都有, 当"本机私有信息"扫会全量误报。
+        if any(low.startswith(g) for g in GENERIC_NAMES):
+            continue
         if len(s) < 4 or s in seen:
             continue
         seen.add(s)
