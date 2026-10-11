@@ -116,6 +116,13 @@ FORWARD_STRIP = HOP_BY_HOP | {"host", "content-length"}
 
 MAX_BODY = 64 * 1024 * 1024
 UPSTREAM_TIMEOUT = 600.0        # 转发时等后端的秒数 (生成可能很久)
+# `/status` 是**给监控窗口每 2 秒轮询一次**的进度查询, 必须自己带短超时。
+# 跟着 UPSTREAM_TIMEOUT(600s) 走会出事: 后端正忙着生成时, /status 会挂在
+# 上游最长 600 秒, 每 2 秒又来一个 -> ThreadingHTTPServer 的 handler 线程
+# 被一个个占住不放, 十几分钟就能堆到几百个, 网关直接饿死成
+# 「端口还在听、但每个请求都被立刻关掉」(2026-10-10 22:40 起跑了 12 小时
+# 的那个网关就是这样卡死的)。进度查询拿不到就拿不到, 下一轮 2 秒后重试。
+STATUS_TIMEOUT = 2.0
 LOG_ROTATE_BYTES = 10 * 1024 * 1024
 SSE_POLL = 0.5                  # 网关自答 /models/sse 时轮询状态的间隔
 
@@ -1374,7 +1381,9 @@ class GatewayHandler(BaseHTTPRequestHandler):
         """整包转发 (需要网关改写响应体的接口), 不走流式。"""
         b = self.app.backends[group]
         conn = http.client.HTTPConnection("127.0.0.1", b.port,
-                                          timeout=UPSTREAM_TIMEOUT)
+                                          timeout=STATUS_TIMEOUT
+                                          if self.path == "/status"
+                                          else UPSTREAM_TIMEOUT)
         try:
             headers = {k: v for k, v in self.headers.items()
                        if k.lower() not in FORWARD_STRIP}
