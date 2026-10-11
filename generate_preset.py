@@ -46,7 +46,10 @@ def _kv_lines(scope: str, params: Dict[str, Any],
         return val or None
 
     for p in _all_params_meta():
-        if p["scope"] not in (scope, "both"):
+        # scope="pool" 是主池 llama-server 专属的 key (kvmem 分支不认识的那组
+        # 草稿参数)。本文件只渲染主池段, 所以对它等价于 "model" —— 必须放行,
+        # 否则主池的推测解码面板勾了也写不进 ini。
+        if p["scope"] not in (scope, "both", "pool"):
             continue
         k = p["key"]
         if k in skip_keys or k not in params:
@@ -143,8 +146,11 @@ def render(cfg: Dict[str, Any], known: Optional[Set[str]] = None,
         # 快捷字段被单独取消勾选的, params 里那份也不许写出来
         excl.update(k for k in config.DRAFT_SHORTCUT_KEYS if not _en(k))
         if not draft_on:
-            # 开关关闭: params 里的草稿/推测参数一律不写 (兼容旧配置残留)
-            excl.update(k for k in mp if k == "spec-type" or k.startswith("spec-draft-"))
+            # 开关关闭: params 里的草稿/推测参数一律不写 (兼容旧配置残留)。
+            # 按 DRAFT_BOX_KEYS 而不是 "spec-draft-" 前缀 —— kvmem 的
+            # --spec-kv-dtype 同样是草稿相关 flag, 前缀筛不到它。
+            excl.update(k for k in mp
+                        if k in config.DRAFT_BOX_KEYS or k.startswith("spec-"))
         # 模型段总是显式写出 (即使与全局段相同),
         # 这样用户能在 ini 里看到自己勾选/设置的状态
         for ln in _kv_lines("model", mp, skip_keys=excl, known=known, skipped=skipped):

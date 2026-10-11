@@ -308,47 +308,84 @@ PARAM_SCHEMA: List[Dict[str, Any]] = [
     Param("mtmd-batch-max-tokens", "多模态批 tokens", "1024", kind="int", scope="model", category="advanced",
           description=_D("多模态编码时一次最多处理多少 image token。")),
     # ============== 推测解码 ==============
+    # 这组的 scope 有两种, 原因在二进制本身, 不是 UI 偏好:
+    #   * 主池 llama-server (b11200) 支持**独立草稿模型** —— spec-draft-* 一整组都在;
+    #   * KVMem 分支 llama-kvmem-server 的 --help 里 spec/MTP flag **只有 4 个**:
+    #       --spec-type / --spec-draft-n-max / --spec-draft-p-min / --spec-kv-dtype
+    #     官方 README 明写 "independent draft models remain unsupported"
+    #     —— 它没有独立草稿模型的概念, 所以草稿路径 / GPU 层数 / 设备 / 线程 /
+    #     n-min / p-split / 草稿 KV 量化 / 后端采样这些 flag 在它 --help 里
+    #     **一个都没有**, 传进去只会被跳过 (勾了也是静默失效)。
+    # 因此那 10 个改成 scope="pool" (主池专用): 主池照常写进 router-preset.ini,
+    # KVMem 页与 KVMem 分支不再产出 (见 POOL_ONLY_SPEC_KEYS / KVMEM_SPEC_KEYS)。
+    # 主池仍然需要它们, 所以一个都不能删, 只能限定作用域。
+    #
+    # ⚠ 别把 kvmem 的 --spec-kv-dtype 和上游的 --spec-draft-type-k/-v 混用:
+    #   上游是 K、V **各一个** flag; kvmem 是**单个** --spec-kv-dtype (K/V 一起)。
+    #   前三个 (spec-type / n-max / p-min) 两边同名同义, 可以共用。
     Param("spec-type", "推测类型", "", kind="choice", scope="model", category="common",
           hint="draft-mtp / draft-dflash / draft-dflash2 / draft-dspark / ngram-*",
           description=_D("推测解码类型。MTP/DFlash/DFlash2 模型自动识别。")),
-    Param("spec-draft-model", "草稿模型路径", "", kind="text", scope="model", category="common",
+    # -- 以下 10 项 kvmem 分支的二进制**不认识** (见上面的说明), 只能主池用 --
+    Param("spec-draft-model", "草稿模型路径", "", kind="text", scope="pool", category="common",
           hint="MTP/DFlash 等 .gguf 路径",
-          description=_D("推测解码的草稿模型 .gguf 绝对路径。")),
-    Param("spec-draft-ngl", "草稿 GPU 层数", "auto", kind="text", scope="model", category="common",
+          description=_D("推测解码的草稿模型 .gguf 绝对路径。\n"
+                         "⚠ 主池 llama-server 专用 —— llama-kvmem-server 不支持独立草稿模型。")),
+    Param("spec-draft-ngl", "草稿 GPU 层数", "auto", kind="text", scope="pool", category="common",
           hint="auto / 99 / 0",
-          description=_D("草稿模型放多少层到 GPU。")),
-    Param("spec-draft-device", "草稿模型设备", "", kind="text", scope="model", category="advanced",
+          description=_D("草稿模型放多少层到 GPU。\n"
+                         "⚠ 主池 llama-server 专用 —— kvmem 分支没有独立草稿模型, 也就没有草稿的 GPU 层数。")),
+    Param("spec-draft-device", "草稿模型设备", "", kind="text", scope="pool", category="advanced",
           hint="需启用推测解码",
           description=_D("草稿模型用哪个 GPU (如 0)。留空自动。\n"
+                         "⚠ 主池 llama-server 专用 —— kvmem 分支没有独立草稿模型。\n"
                          "仅在「启用推测解码」勾选且本项也勾选时才写入 preset。")),
     Param("spec-draft-n-max", "草稿最大 token", "3", kind="int", scope="model", category="advanced",
-          description=_D("每轮推测最多生成多少个候选 token。")),
-    Param("spec-draft-n-min", "草稿最小 token", "0", kind="int", scope="model", category="advanced",
-          description=_D("少于这个数不触发验证。")),
-    Param("spec-draft-p-split", "草稿拆分概率", "0.1", kind="float", scope="model", category="advanced",
-          description=_D("触发推测的拆分概率阈值。")),
+          description=_D("每轮推测最多生成多少个候选 token。\n"
+                         "kvmem 分支的同义 flag: --spec-draft-n-max (默认 3)。")),
+    Param("spec-draft-n-min", "草稿最小 token", "0", kind="int", scope="pool", category="advanced",
+          description=_D("少于这个数不触发验证。\n"
+                         "⚠ 主池 llama-server 专用 —— kvmem 分支的 --help 里没有这一项。")),
+    Param("spec-draft-p-split", "草稿拆分概率", "0.1", kind="float", scope="pool", category="advanced",
+          description=_D("触发推测的拆分概率阈值。\n"
+                         "⚠ 主池 llama-server 专用 —— kvmem 分支的 --help 里没有这一项。")),
     Param("spec-draft-p-min", "草稿最小概率", "0.0", kind="float", scope="model", category="advanced",
-          description=_D("贪心模式下的最小接受概率。")),
-    Param("spec-draft-threads", "草稿 CPU 线程", "", kind="int", scope="model", category="advanced",
+          description=_D("贪心模式下的最小接受概率。\n"
+                         "kvmem 分支的同义 flag: --spec-draft-p-min (默认 0)。")),
+    Param("spec-draft-threads", "草稿 CPU 线程", "", kind="int", scope="pool", category="advanced",
           hint="需启用推测解码",
           description=_D("草稿模型用的 CPU 线程数。留空跟随主模型。\n"
+                         "⚠ 主池 llama-server 专用 —— kvmem 分支没有独立草稿模型。\n"
                          "仅在「启用推测解码」勾选且本项也勾选时才写入 preset。")),
-    Param("spec-draft-threads-batch", "草稿批线程", "", kind="int", scope="model", category="advanced",
+    Param("spec-draft-threads-batch", "草稿批线程", "", kind="int", scope="pool", category="advanced",
           hint="需启用推测解码",
           description=_D("草稿模型批处理线程。\n"
+                         "⚠ 主池 llama-server 专用 —— kvmem 分支没有独立草稿模型。\n"
                          "仅在「启用推测解码」勾选且本项也勾选时才写入 preset。")),
-    Param("spec-draft-type-k", "草稿 KV K", "f16", kind="choice", scope="model", category="advanced",
+    Param("spec-draft-type-k", "草稿 KV K", "f16", kind="choice", scope="pool", category="advanced",
           hint="需启用推测解码",
           description=_D("草稿模型的 K 缓存量化 (llama-server: --spec-draft-type-k)。f16 即可。\n"
+                         "⚠ 主池 llama-server 专用 —— kvmem 分支改用单个 --spec-kv-dtype (K/V 一起)。\n"
                          "仅在「启用推测解码」勾选且本项也勾选时才写入 preset。")),
-    Param("spec-draft-type-v", "草稿 KV V", "f16", kind="choice", scope="model", category="advanced",
+    Param("spec-draft-type-v", "草稿 KV V", "f16", kind="choice", scope="pool", category="advanced",
           hint="需启用推测解码",
           description=_D("草稿模型的 V 缓存量化 (llama-server: --spec-draft-type-v)。\n"
+                         "⚠ 主池 llama-server 专用 —— kvmem 分支改用单个 --spec-kv-dtype (K/V 一起)。\n"
                          "仅在「启用推测解码」勾选且本项也勾选时才写入 preset。")),
-    Param("spec-draft-backend-sampling", "草稿后端采样", "true", kind="bool", scope="model", category="advanced",
+    Param("spec-draft-backend-sampling", "草稿后端采样", "true", kind="bool", scope="pool", category="advanced",
           hint="需启用推测解码",
           description=_D("把草稿采样放到后端 (默认 true)。\n"
+                         "⚠ 主池 llama-server 专用 —— kvmem 分支没有独立草稿模型。\n"
                          "仅在「启用推测解码」勾选且本项也勾选时才写入 preset。")),
+    Param("spec-kv-dtype", "草稿 KV 类型", "f16", kind="choice", scope="model", category="advanced",
+          hint="f16/f32/q8_0/q5_0/q4_0",
+          description=_D("MTP 草稿 (draft) 的 K/V 缓存精度 —— 等价于上游 llama-server 的\n"
+                         "草稿 KV 量化 (--spec-draft-type-k / --spec-draft-type-v)。\n"
+                         "⚠ 注意写法: kvmem 分支是**单个** --spec-kv-dtype (K 与 V 一起设),\n"
+                         "不是上游那种 K/V 分开的两个 flag, 两者不要混用。\n"
+                         "官方默认 f16; 主池 llama-server 的 --help 里没有这个 flag,\n"
+                         "生成 router-preset.ini 时会自动跳过。\n"
+                         "仅在「启用推测解码」勾选且本项也勾选时才写入。")),
     # ============== 杂项 ==============
     Param("warmup", "加载时预热", "true", kind="bool", scope="both", category="advanced",
           description=_D("加载完模型后空跑一次预热。")),
@@ -456,20 +493,45 @@ STRATA_RUNTIME = "strata"
 
 KVMEM_SCOPED_KEYS = frozenset(p["key"] for p in PARAM_SCHEMA if p["scope"] == "kvmem")
 
+# scope="pool" = **主池 llama-server 专用**, KVMem 页/分支一律不产出。
+# 起因是二进制能力差异 (不是 UI 偏好): llama-kvmem-server 的 --help 里 spec/MTP
+# flag 只有 4 个, 官方 README 明写 "independent draft models remain unsupported"
+# —— 没有独立草稿模型, 草稿路径/GPU 层数/设备/线程/n-min/p-split/草稿 KV 量化/
+# 后端采样这些 flag 一个都没有, 传进去只会被跳过。
+# 主池 b11200 仍然需要这 10 个, 所以只能限定作用域, 不能删。
+POOL_SCOPED_KEYS = frozenset(p["key"] for p in PARAM_SCHEMA if p["scope"] == "pool")
+
+# KVMem 分支二进制真实支持的 spec/MTP flag —— 逐个对过 llama-kvmem-server --help:
+#   --spec-type         none | draft-mtp
+#   --spec-draft-n-max  MTP draft tokens (默认 3)
+#   --spec-draft-p-min  min draft probability
+#   --spec-kv-dtype     MTP K/V type (默认 f16) —— K/V 合成**一个** flag
+# 草稿面板按工作区裁剪时以它为准 (见 ui.py 的 _draft_spec_keys)。
+KVMEM_SPEC_KEYS = frozenset({
+    "spec-type", "spec-draft-n-max", "spec-draft-p-min", "spec-kv-dtype",
+})
+
 # 「推测解码」草稿面板 (draft_box) 专属的 key: 面板里已有控件,
 # 不在模型参数子表里重复出现 (子表那份会被 draft_* 顶层字段覆盖, 属于静默失效)。
+#   DRAFT_BOX_KEYS == DRAFT_QUICK_KEYS | DRAFT_OPT_KEYS | {"spec-type"}
 DRAFT_BOX_KEYS = frozenset({
     "spec-type",
     "spec-draft-model", "spec-draft-n-max", "spec-draft-n-min",
     "spec-draft-p-split", "spec-draft-p-min", "spec-draft-ngl",
     "spec-draft-device", "spec-draft-threads", "spec-draft-threads-batch",
     "spec-draft-type-k", "spec-draft-type-v", "spec-draft-backend-sampling",
+    # kvmem 的 MTP K/V 类型 (单个 flag; 与上面的 type-k/-v 不是一回事)
+    "spec-kv-dtype",
 })
 
-# 草稿面板「高级」区的 6 个可选项: 各自带勾选框, 勾了才写入 ini。
+# 草稿面板「高级」区的可选项: 各自带勾选框, 勾了才写入 ini。
+# 前 6 个是 scope="pool" 的主池专属项, KVMem 页不渲染 (ui.py 按工作区裁剪);
+# spec-kv-dtype 是 kvmem 分支唯一支持的草稿 KV 精度 flag, 主池也照常渲染
+# (主池 llama-server 不认识它, generate_preset 会按 known 自动跳过)。
 DRAFT_OPT_KEYS = (
     "spec-draft-device", "spec-draft-threads", "spec-draft-threads-batch",
     "spec-draft-type-k", "spec-draft-type-v", "spec-draft-backend-sampling",
+    "spec-kv-dtype",
 )
 
 # 草稿面板「快捷」区直接显示的 7 个字段: 每个自带勾选框, 勾了才写入 ini。
@@ -874,7 +936,12 @@ def _ensure_model_params(m: Dict[str, Any]) -> None:
                 continue
             # kvmem 常用项默认勾上, 否则 9 项全要手动勾一遍
             enabled, default = p["key"] in kvmem_common, p["default"]
-        elif p["scope"] in ("model", "both"):
+        elif p["scope"] in ("model", "both", "pool"):
+            # scope="pool" = 主池 llama-server 专属 (草稿路径/GPU 层数/线程/
+            # 草稿 KV 量化那一组)。kvmem 分支的 --help 里根本没有这些 flag,
+            # 补进去只会让人以为改了能生效 —— 所以 kvmem 档位一律不补。
+            if kvmem_only and p["scope"] == "pool":
+                continue
             enabled, default = _default_enabled(p["key"]), p["default"]
         else:
             continue
@@ -886,9 +953,9 @@ def _ensure_model_params(m: Dict[str, Any]) -> None:
             # kvmem 专属的额外参数 (bat 导入的冷门 flag) 只给 kvmem 档位
             if not kvmem_only:
                 continue
-        elif scope not in ("model", "both", "global"):
+        elif scope not in ("model", "both", "global", "pool"):
             continue
-        elif kvmem_only and scope == "model":
+        elif kvmem_only and scope in ("model", "pool"):
             # 主池专属的额外参数不该塞进 kvmem 档位 (kvmem 面板也看不到它)
             continue
         if p["key"] not in params:
@@ -914,6 +981,8 @@ def list_kinds_choices() -> Dict[str, List[str]]:
         "cache-type-v": ["f32", "f16", "bf16", "q8_0", "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1"],
         "spec-draft-type-k": ["f32", "f16", "bf16", "q8_0", "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1"],
         "spec-draft-type-v": ["f32", "f16", "bf16", "q8_0", "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1"],
+        # kvmem 的 MTP K/V 类型 (单个 flag, K/V 一起设) —— 候选沿用上面的 KV 风格
+        "spec-kv-dtype": ["f16", "f32", "bf16", "q8_0", "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1"],
         "split-mode": ["none", "layer", "row", "tensor"],
         "load-mode": ["auto", "none", "mmap", "mlock", "mmap+mlock", "dio"],
         "lazy-mode": ["on", "off", "auto"],

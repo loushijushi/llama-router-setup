@@ -349,8 +349,12 @@ class ParamRow:
 # =========================================================================
 # ParamPanel 的作用域 -> 允许出现的参数 scope 集合
 #   model      模型页 (主池)             = model + both
-#   kvmem      旧写法, 与 kvmem_full 等价  = kvmem + both + model
-#   kvmem_full 「⚡ KVMem」页 = 与模型页完全一致 + kvmem 专属项
+#   kvmem      旧写法, 与 kvmem_full 等价  = kvmem + both
+#   kvmem_full 「⚡ KVMem」页 = 模型页全部 + kvmem 专属项
+# scope="pool" (主池 llama-server 专属, 见 config.POOL_SCOPED_KEYS) 不在这里列出:
+# 那一组 (草稿模型路径 / GPU 层数 / 设备 / 线程 / n-min / p-split / 草稿 KV 量化 /
+# 后端采样) 全部属于草稿面板 DRAFT_BOX_KEYS, 由 draft_box 直接渲染, 参数子表两页
+# 都不显示它们; 面板要显示什么, 以 DRAFT_BOX_KEYS + KVMEM_SPEC_KEYS 为准。
 _SCOPE_SET = {
     "model": frozenset({"model", "both"}),
     "kvmem": frozenset({"kvmem", "both"}),
@@ -916,7 +920,7 @@ class ExtraParamDialog(tk.Toplevel):
                              state="readonly").grid(row=i, column=1, sticky=tk.W, pady=4)
             elif kind == "combo_scope":
                 ttk.Combobox(f, textvariable=self.var_scope, width=20,
-                             values=["global", "model", "both"],
+                             values=["global", "model", "both", "pool", "kvmem"],
                              state="readonly").grid(row=i, column=1, sticky=tk.W, pady=4)
             elif kind == "combo_cat":
                 ttk.Combobox(f, textvariable=self.var_category, width=20,
@@ -3463,6 +3467,17 @@ class App(tk.Tk):
         W.var_draft_p_split = tk.StringVar(value="0.1")
         W.var_draft_p_min = tk.StringVar(value="0.0")
         W.var_draft_ngl = tk.StringVar(value="auto")
+        # 草稿面板按工作区裁剪: 面板上每个控件背后都是一条 CLI flag, 所以只能
+        # 显示这个工作区**真正指向的那个程序**认识的那几条。
+        #   pool  -> 主池 llama-server, 支持独立草稿模型 (上游 spec-draft-* 齐全)
+        #   kvmem -> llama-kvmem-server, --help 里 spec/MTP flag 只有 4 个:
+        #             --spec-type / --spec-draft-n-max / --spec-draft-p-min /
+        #             --spec-kv-dtype (官方 README 明确不支持独立草稿模型)
+        # 见 config.KVMEM_SPEC_KEYS。裁掉的那几条对 kvmem 是静默失效, 显示出来
+        # 只会让人以为改了有用。
+        W._draft_kv = getattr(W, "ws_kind", "pool") == "kvmem"
+        spec_keys = config.KVMEM_SPEC_KEYS if W._draft_kv else config.DRAFT_BOX_KEYS
+        opt_keys = tuple(k for k in config.DRAFT_OPT_KEYS if k in spec_keys)
         # 每个快捷字段前面一个勾选框: 勾了才写入 preset.ini (draft_en 存进模型配置)
         W.var_draft_en: Dict[str, Any] = {
             k: tk.BooleanVar(value=True) for k in config.DRAFT_SHORTCUT_KEYS
@@ -3487,69 +3502,86 @@ class App(tk.Tk):
         def _pair(row_key: str, widget) -> None:
             W._draft_en_widgets.setdefault(row_key, []).append(widget)
 
-        # 第 0 行: 草稿模型路径 (可选项 — 模型自带草稿时留空)
-        _cb("spec-draft-model", "草稿模型 .gguf (可选):", 0)
-        _e = ttk.Entry(W.draft_box, textvariable=W.var_draft_model)
-        _e.grid(row=0, column=1, columnspan=2, sticky=tk.EW, pady=3)
-        _pair("spec-draft-model", _e)
-        _b = ttk.Button(W.draft_box, text="浏览...",
-                        command=lambda: self._browse(W.var_draft_model, "gguf"))
-        _b.grid(row=0, column=3, padx=4)
-        _pair("spec-draft-model", _b)
+        _row = 0
+        # 第 0 行: 草稿模型路径 (可选项 — 模型自带草稿时留空; kvmem 不支持)
+        if "spec-draft-model" in spec_keys:
+            _cb("spec-draft-model", "草稿模型 .gguf (可选):", _row)
+            _e = ttk.Entry(W.draft_box, textvariable=W.var_draft_model)
+            _e.grid(row=_row, column=1, columnspan=2, sticky=tk.EW, pady=3)
+            _pair("spec-draft-model", _e)
+            _b = ttk.Button(W.draft_box, text="浏览...",
+                            command=lambda: self._browse(W.var_draft_model, "gguf"))
+            _b.grid(row=_row, column=3, padx=4)
+            _pair("spec-draft-model", _b)
+            _row += 1
         # 第 1 行: 推测类型 + 提示
-        _cb("spec-type", "推测类型:", 1)
-        _c = ttk.Combobox(W.draft_box, textvariable=W.var_draft_type, width=14,
-                          values=self._choices["spec-type"])
-        _c.grid(row=1, column=1, sticky=tk.W, pady=3)
-        _pair("spec-type", _c)
-        ttk.Label(W.draft_box, text="(留空按文件名自动猜; 无草稿文件时请选类型)",
-                  foreground="#888").grid(row=1, column=2, columnspan=2,
-                                          padx=4, sticky=tk.W)
-        # 第 2 行: n-max / n-min
-        _cb("spec-draft-n-max", "n-max:", 2, col=0)
+        if "spec-type" in spec_keys:
+            _cb("spec-type", "推测类型:", _row)
+            _c = ttk.Combobox(W.draft_box, textvariable=W.var_draft_type, width=14,
+                              values=self._choices["spec-type"])
+            _c.grid(row=_row, column=1, sticky=tk.W, pady=3)
+            _pair("spec-type", _c)
+            ttk.Label(W.draft_box, text="(留空按文件名自动猜; 无草稿文件时请选类型)",
+                      foreground="#888").grid(row=_row, column=2, columnspan=2,
+                                              padx=4, sticky=tk.W)
+            _row += 1
+        # 第 2 行: n-max / n-min (kvmem 只有 n-max)
+        _cb("spec-draft-n-max", "n-max:", _row, col=0)
         _s = ttk.Spinbox(W.draft_box, textvariable=W.var_draft_n_max, width=8,
                          from_=1, to=16)
-        _s.grid(row=2, column=1, sticky=tk.W, pady=3)
+        _s.grid(row=_row, column=1, sticky=tk.W, pady=3)
         _pair("spec-draft-n-max", _s)
-        _cb("spec-draft-n-min", "n-min:", 2, col=2)
-        _s = ttk.Spinbox(W.draft_box, textvariable=W.var_draft_n_min, width=8,
-                         from_=0, to=16)
-        _s.grid(row=2, column=3, sticky=tk.W, pady=3)
-        _pair("spec-draft-n-min", _s)
-        # 第 3 行: p-split / p-min
-        _cb("spec-draft-p-split", "p-split:", 3, col=0)
-        _s = ttk.Spinbox(W.draft_box, textvariable=W.var_draft_p_split, width=8,
-                         from_=0.0, to=1.0, increment=0.05)
-        _s.grid(row=3, column=1, sticky=tk.W, pady=3)
-        _pair("spec-draft-p-split", _s)
-        _cb("spec-draft-p-min", "p-min:", 3, col=2)
+        if "spec-draft-n-min" in spec_keys:
+            _cb("spec-draft-n-min", "n-min:", _row, col=2)
+            _s = ttk.Spinbox(W.draft_box, textvariable=W.var_draft_n_min, width=8,
+                             from_=0, to=16)
+            _s.grid(row=_row, column=3, sticky=tk.W, pady=3)
+            _pair("spec-draft-n-min", _s)
+        _row += 1
+        # 第 3 行: p-split / p-min (kvmem 只有 p-min)
+        if "spec-draft-p-split" in spec_keys:
+            _cb("spec-draft-p-split", "p-split:", _row, col=0)
+            _s = ttk.Spinbox(W.draft_box, textvariable=W.var_draft_p_split, width=8,
+                             from_=0.0, to=1.0, increment=0.05)
+            _s.grid(row=_row, column=1, sticky=tk.W, pady=3)
+            _pair("spec-draft-p-split", _s)
+        _cb("spec-draft-p-min", "p-min:", _row, col=2)
         _s = ttk.Spinbox(W.draft_box, textvariable=W.var_draft_p_min, width=8,
                          from_=0.0, to=1.0, increment=0.05)
-        _s.grid(row=3, column=3, sticky=tk.W, pady=3)
+        _s.grid(row=_row, column=3, sticky=tk.W, pady=3)
         _pair("spec-draft-p-min", _s)
-        # 第 4 行: ngl
-        _cb("spec-draft-ngl", "草稿 GPU 层数:", 4)
-        _c = ttk.Combobox(W.draft_box, textvariable=W.var_draft_ngl, width=14,
-                          values=self._choices["spec-draft-ngl"])
-        _c.grid(row=4, column=1, sticky=tk.W, pady=3)
-        _pair("spec-draft-ngl", _c)
-        ttk.Label(W.draft_box, text="(auto 自动, 0 纯 CPU, 99 全 GPU)",
-                  foreground="#888").grid(row=4, column=2, columnspan=2,
-                                          padx=4, sticky=tk.W)
+        _row += 1
+        # 第 4 行: ngl (草稿 GPU 层数; kvmem 不支持独立草稿模型)
+        if "spec-draft-ngl" in spec_keys:
+            _cb("spec-draft-ngl", "草稿 GPU 层数:", _row)
+            _c = ttk.Combobox(W.draft_box, textvariable=W.var_draft_ngl, width=14,
+                              values=self._choices["spec-draft-ngl"])
+            _c.grid(row=_row, column=1, sticky=tk.W, pady=3)
+            _pair("spec-draft-ngl", _c)
+            ttk.Label(W.draft_box, text="(auto 自动, 0 纯 CPU, 99 全 GPU)",
+                      foreground="#888").grid(row=_row, column=2, columnspan=2,
+                                              padx=4, sticky=tk.W)
+            _row += 1
 
         # ===== 高级可选项: 每项独立勾选, 勾了才写入 ini =====
         ttk.Separator(W.draft_box, orient=tk.HORIZONTAL).grid(
-            row=5, column=0, columnspan=4, sticky=tk.EW, pady=(6, 3))
-        ttk.Label(W.draft_box, text="高级 (可选, 勾选后才写入 preset.ini)",
-                  foreground="#555").grid(row=6, column=0, columnspan=4,
+            row=_row, column=0, columnspan=4, sticky=tk.EW, pady=(6, 3))
+        _row += 1
+        ttk.Label(W.draft_box, text="高级 (可选, 勾选后才写入参数)",
+                  foreground="#555").grid(row=_row, column=0, columnspan=4,
                                           sticky=tk.W, pady=(0, 2))
+        _row += 1
         W.var_draft_opt: Dict[str, Any] = {}
         for i, key in enumerate(config.DRAFT_OPT_KEYS):
+            if key not in opt_keys:
+                continue
             meta = config.SCHEMA_INDEX.get(key, {})
             en = tk.BooleanVar(value=False)
             va = tk.StringVar(value=str(meta.get("default", "")))
             W.var_draft_opt[key] = (en, va)
-            r = 7 + i
+            # 行号用游标而不是 _row+i —— 裁掉的项不占位, 否则面板中间会留空洞
+            r = _row
+            _row += 1
             ttk.Checkbutton(W.draft_box, variable=en).grid(
                 row=r, column=0, sticky=tk.W, pady=2, padx=(0, 2))
             ttk.Label(W.draft_box, text=meta.get("label", key)).grid(
@@ -5105,22 +5137,36 @@ class App(tk.Tk):
         m["draft_model"] = W.var_draft_model.get().strip()
         m["draft_type"] = W.var_draft_type.get().strip()
         m["draft_n_max"] = W.var_draft_n_max.get().strip() or "3"
-        m["draft_n_min"] = W.var_draft_n_min.get().strip() or "0"
-        m["draft_p_split"] = W.var_draft_p_split.get().strip() or "0.1"
         m["draft_p_min"] = W.var_draft_p_min.get().strip() or "0.0"
-        m["draft_ngl"] = W.var_draft_ngl.get().strip() or "auto"
+        # n-min / p-split / ngl 是**主池专属**的三个快捷字段 (scope="pool"):
+        # llama-kvmem-server 的 --help 里没有它们, 该工作区里也没有对应控件
+        # (见 _build_model_editor 的 spec_keys 裁剪), 所以不落盘。
+        if getattr(W, "_draft_kv", False):
+            m.pop("draft_n_min", None)
+            m.pop("draft_p_split", None)
+            m.pop("draft_ngl", None)
+        else:
+            m["draft_n_min"] = W.var_draft_n_min.get().strip() or "0"
+            m["draft_p_split"] = W.var_draft_p_split.get().strip() or "0.1"
+            m["draft_ngl"] = W.var_draft_ngl.get().strip() or "auto"
         # 快捷字段勾选状态 (每个字段独立决定写不写 ini)
         m["draft_en"] = {k: bool(v.get()) for k, v in W.var_draft_en.items()}
         # 同步到 params 字典 (给 generate_preset 写 ini 使用)
         # 启用后草稿文件可选: 无路径时只写 spec-type 等其余草稿参数
         params = m.setdefault("params", {})
+
+        def _shown(row_key: str) -> bool:
+            """该工作区的草稿面板是否真的渲染了这一项 (没渲染 = 不写 params)。"""
+            return row_key in W._draft_en_cbs
+
         # 高级可选项: 勾选状态直接落进 params (受草稿总开关抑制, 由 generate_preset 把关)
         for key, (en, va) in W.var_draft_opt.items():
             params[key] = {"enabled": bool(en.get()),
                            "value": va.get().strip()}
         if m["draft_enabled"]:
             en = m["draft_en"]
-            if m["draft_model"]:
+            ngl = W.var_draft_ngl.get().strip()
+            if m["draft_model"] and _shown("spec-draft-model"):
                 params["spec-draft-model"] = {
                     "enabled": bool(en.get("spec-draft-model", True)),
                     "value": m["draft_model"]}
@@ -5128,15 +5174,23 @@ class App(tk.Tk):
                 params.pop("spec-draft-model", None)
             params["spec-draft-n-max"] = {"enabled": bool(en.get("spec-draft-n-max", True)),
                                           "value": m["draft_n_max"]}
-            params["spec-draft-n-min"] = {"enabled": bool(en.get("spec-draft-n-min", True)),
-                                          "value": m["draft_n_min"]}
-            params["spec-draft-p-split"] = {"enabled": bool(en.get("spec-draft-p-split", True)),
-                                            "value": m["draft_p_split"]}
+            if _shown("spec-draft-n-min"):
+                params["spec-draft-n-min"] = {"enabled": bool(en.get("spec-draft-n-min", True)),
+                                              "value": W.var_draft_n_min.get().strip() or "0"}
+            else:
+                params.pop("spec-draft-n-min", None)
+            if _shown("spec-draft-p-split"):
+                params["spec-draft-p-split"] = {"enabled": bool(en.get("spec-draft-p-split", True)),
+                                                "value": W.var_draft_p_split.get().strip() or "0.1"}
+            else:
+                params.pop("spec-draft-p-split", None)
             params["spec-draft-p-min"] = {"enabled": bool(en.get("spec-draft-p-min", True)),
                                           "value": m["draft_p_min"]}
-            if m["draft_ngl"]:
+            if ngl and _shown("spec-draft-ngl"):
                 params["spec-draft-ngl"] = {"enabled": bool(en.get("spec-draft-ngl", True)),
-                                            "value": m["draft_ngl"]}
+                                            "value": ngl}
+            else:
+                params.pop("spec-draft-ngl", None)
         else:
             # 关闭开关 -> 清掉草稿快捷参数 (值来自顶层 draft_* 字段), 不写入 preset。
             # 高级可选项保留勾选状态, 由 generate_preset 按总开关抑制输出。

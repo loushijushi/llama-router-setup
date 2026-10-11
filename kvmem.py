@@ -208,10 +208,29 @@ def _draft_shortcut(m: Dict[str, Any]) -> Dict[str, str]:
     return out
 
 
+def _supported(key: str, known: frozenset) -> bool:
+    """这个分支程序认不认 key (bool 参数还要看 --no- 形式)。
+
+    known 为空 = 没拿到 --help (程序没装 / 调用方显式不过滤) -> 一律放行,
+    与 generate_preset 对 known=None 的既有口径一致。
+    """
+    if not known:
+        return True
+    return key in known or ("no-" + key) in known
+
+
 def build_args(cfg: Dict[str, Any], model: Dict[str, Any],
                known: Optional[frozenset] = None,
                skipped: Optional[List[str]] = None) -> List[str]:
-    """模型条目 -> llama-kvmem-server 命令行参数 (不含 exe 本身)。"""
+    """模型条目 -> llama-kvmem-server 命令行参数 (不含 exe 本身)。
+
+    分支程序与主路由的 flag 集合**不一样**, 而 config.json 里档位和主池模型
+    是同一份清单 —— 主池 llama-server 认识的那组 spec-draft-* (草稿模型路径/
+    GPU 层数/线程/草稿 KV 量化...) 在 llama-kvmem-server 的 --help 里一个都
+    没有 (官方 README: "independent draft models remain unsupported")。
+    那种「本来就不适用」不是配置写错, 所以这里按 known 直接**不产出**,
+    也不记进 skipped —— skipped 只应反映意外, 不该被这类常态项刷屏。
+    """
     if known is None:
         known = known_keys(find_exe(cfg))
 
@@ -244,10 +263,16 @@ def build_args(cfg: Dict[str, Any], model: Dict[str, Any],
         # 草稿关掉时 spec-* 一概不写 (与 generate_preset.render 同一套规则)
         if not draft_on and k.startswith("spec-"):
             continue
+        # 分支程序 --help 里没有的 flag 直接不产出 (见 build_args 的 docstring)
+        if not _supported(k, known):
+            continue
         _append_flag(args, k, node.get("value", ""), p.get("kind", "text"),
                      known, skipped)
 
     for k, v in shortcut.items():
+        # _draft_shortcut 是整组产出的, 同样按 known 裁一刀
+        if not _supported(k, known):
+            continue
         kind = (schema.get(k) or {}).get("kind", "text")
         _append_flag(args, k, v, kind, known, skipped)
 
