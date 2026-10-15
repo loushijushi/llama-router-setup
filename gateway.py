@@ -765,6 +765,16 @@ class GatewayState:
                 self.active_model = b.model_id
                 self.last_error = ""
                 self._persist_serve_mode(group)
+                # Strata 是单模型进程, 同一时刻只可能有一个档位在显存里。
+                # **必须把这次的档位回写进 config.strata.active_id**:
+                # `/v1/models` 的 loaded 标记是拿 active_id 去比对后端自报的
+                # 档位 (见 _merge_strata_status), 而 Strata 又只有 /health 没有
+                # /v1/models, 引擎不报自己是哪一个。原来只回写 serve_mode,
+                # 于是切到别的 Strata 档位后 active_id 还停在上一次的值,
+                # 状态显示整个对不上 —— 明明在跑 IQ3_S, 面板却显示 IQ3_XXS 已加载。
+                if group == STRATA and model_entry is not None:
+                    self._persist_strata_active_id(
+                        str(model_entry.get("id") or ""))
             except Exception as e:                      # noqa: BLE001
                 self.last_error = str(e)
                 try:
@@ -837,6 +847,31 @@ class GatewayState:
             if str(cur.get("serve_mode") or "router") != want:
                 cur["serve_mode"] = want
                 config.save(cur)
+        except Exception:
+            pass
+
+    def _persist_strata_active_id(self, model_id: str) -> None:
+        """把「当前跑着的 Strata 档位」写回 config.strata.active_id。
+
+        与 _persist_serve_mode 配套: 后者记的是「哪一组活跃」, 这个记的是
+        「该组里具体哪个档位」。Strata 是单模型进程, 引擎只有 /health 没有
+        /v1/models, 不会告诉外界自己加载的是哪个 —— 所以这个字段就是唯一的
+        真相来源, `_merge_strata_status` 靠它判断哪个条目该标 loaded。
+        不回写的话, 切过一次档位之后状态显示就永久停在上一次的值。
+        """
+        mid = str(model_id or "").strip()
+        if not mid:
+            return
+        try:
+            cur = config.load()
+            st = cur.get("strata")
+            if not isinstance(st, dict):
+                return
+            if str(st.get("active_id") or "") == mid:
+                return
+            st["active_id"] = mid
+            config.save(cur)
+            self._log(f"[网关] Strata 当前档位记为 {mid}")
         except Exception:
             pass
 

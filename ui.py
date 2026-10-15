@@ -1833,6 +1833,13 @@ class MonitorWindow(tk.Toplevel):
 
     _SPEED_RE = re.compile(
         r"n_gen\s*=\s*(\d+).*?tg\s*=\s*([\d.]+)\s*t/s.*?tg_3s\s*=\s*([\d.]+)")
+    # KVMem 的 prefill 进度行 (llama-kvmem-server):
+    #   "prompt processing, n_tokens = 122368, progress = 0.53, t = 258.30 s / 473.74 tokens per second"
+    # KVMem 是 llama-server, **没有 /status**, 所以网关给它的 /status 是合成空壳,
+    # 恒为 idle -> 进度条对它一直空白。这里从日志把这行解析出来补上。
+    _PREFILL_RE = re.compile(
+        r"prompt processing,\s*n_tokens\s*=\s*(\d+),\s*progress\s*=\s*([\d.]+)"
+        r".*?t\s*=\s*([\d.]+)\s*s(?:\s*/\s*([\d.]+)\s*tokens per second)?")
 
     def _note_line(self, line: str) -> None:
         """记录一行日志时顺手解析生成速度 (本地读文件和远程拉转发共用)。"""
@@ -1843,6 +1850,18 @@ class MonitorWindow(tk.Toplevel):
                 "n_gen": int(m.group(1)),
                 "tg": float(m.group(2)),
                 "tg_3s": float(m.group(3)),
+                "ts": _time.time(),
+            }
+        p = self._PREFILL_RE.search(line)
+        if p:
+            # 见到 prefill 行 = 正在读 prompt, 此时一定还没进入生成阶段,
+            # 清掉上一轮的生成速度, 否则进度条会拿旧的 n_gen 显示成「生成中」。
+            self._last_speed.pop("__latest__", None)
+            self._last_speed["__prefill__"] = {
+                "processed": int(p.group(1)),
+                "progress": float(p.group(2)),
+                "elapsed_s": float(p.group(3)),
+                "rate": float(p.group(4)) if p.group(4) else None,
                 "ts": _time.time(),
             }
 
@@ -2134,10 +2153,20 @@ class MonitorWindow(tk.Toplevel):
         self.after(500, self._refresh_ui)
 
     def _logs_changed(self) -> bool:
-        """日志 buffer 跟上次渲染比有没有变 (纯 Python, 不碰 Tk)。"""
+        """日志 buffer 跟上次渲染比有没有变 (纯 Python, 不碰 Tk)。
+
+        **必须用「累计写入行数」而不是「buffer 长度」。** 每个文件的 buffer 是
+        `deque(maxlen=_FILE_LINE_MAX)`(300 行), 一旦填满, 新日志进来会挤掉最旧
+        的行, **长度永远是 300 不变**。只比长度的话, 满 300 之后再来的每一行
+        都被判定成「没变」-> 永远不重绘 -> 用户看到的就是「日志不更新, 滚一下
+        才会动」(滚轮事件顺带改了别的状态, 或 _pending_render 兜底补了一次)。
+        `_tail_lines` 是单调递增的累计计数, 挤掉旧行照样 +1, 正好表达
+        「有没有新内容」。
+        """
         try:
-            sig = tuple((n, len(self._file_lines.get(n) or ()))
-                        for n in sorted(self._file_lines))
+            sig = (self._tail_lines,
+                   tuple((n, len(self._file_lines.get(n) or ()))
+                         for n in sorted(self._file_lines)))
         except Exception:
             return True
         if sig != getattr(self, "_logs_sig", None):
@@ -2334,6 +2363,61 @@ class MonitorWindow(tk.Toplevel):
             latest = getattr(self, "_last_speed", {}).get("__latest__", {})
             tok_s = latest.get("tg")
         prefill = generating and (gen in (None, 0))
+        # KVMem/主池没有 /status (网关合成空壳, state 恒 idle), 进度条对它们
+        # 一直是空的。改从日志 tail 解析: prefill 行带 progress/elapsed,
+        # n_gen 行带生成数和 tok/s。日志新鲜度 5 秒内才算, 过期一律回空闲,
+        # 否则面板会一直挂着一个早就结束的数字。
+        if not generating and not prefill:
+            sp = getattr(self, "_last_speed", {}) or {}
+            pre = sp.get("__prefill__")
+            latest = sp.get("__latest__")
+            nowt = time.time()
+            if pre and (nowt - pre.get("ts", 0)) < 5.0:
+                generating = True
+                prefill = True
+                ptok = pre.get("processed")
+                el = pre.get("elapsed_s")
+                tok_s = pre.get("rate")
+                try:
+                    frac = max(0.0, min(1.0, float(pre.get("progress") or 0.0)))
+                except Exception:
+                    frac = 0.0
+                try:
+                    if getattr(self, "_prog_mode", None) != "determinate":
+                        self.prog_bar.stop()
+                        self.prog_bar.configure(mode="determinate")
+                        self._prog_mode = "determinate"
+                    self.prog_bar["value"] = round(frac * 100, 1)
+                    pt = f"{ptok:,}" if isinstance(ptok, int) else "?"
+                    self.prog_var.set(
+                        "进度: 读取 prompt %s tokens (%.0f%%), %.0fs%s"
+                        % (pt, frac * 100, el or 0.0,
+                           (", %.0f tok/s" % tok_s) if tok_s else ""))
+                    self.prog_lbl.configure(foreground="#cc6600")
+                except Exception:
+                    pass
+                return
+            if latest and (nowt - latest.get("ts", 0)) < 5.0:
+                generating = True
+                prefill = False
+                gen = latest.get("n_gen")
+                tok_s = latest.get("tg")
+                mx = None
+                try:
+                    if getattr(self, "_prog_mode", None) != "determinate":
+                        self.prog_bar.stop()
+                        self.prog_bar.configure(mode="determinate")
+                        self._prog_mode = "determinate"
+                    # 没有 max_tokens 就退化成滚动条 (不确定进度时不该假装知道)
+                    self.prog_bar.configure(mode="indeterminate")
+                    self.prog_bar.start()
+                    self._prog_mode = "indeterminate"
+                    rate = ("%.1f tok/s" % tok_s) if tok_s else "—"
+                    self.prog_var.set("进度: 生成中 %s tokens, %s" % (gen, rate))
+                    self.prog_lbl.configure(foreground="#0066cc")
+                except Exception:
+                    pass
+                return
         try:
             if generating and not prefill and gen is not None:
                 frac = 0.0

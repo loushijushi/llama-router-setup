@@ -21,6 +21,7 @@
 import os
 import re
 import subprocess
+import json
 from typing import Any, Dict, List, Optional, Tuple
 
 import config
@@ -374,7 +375,11 @@ def build_model(sc: Script, p: Parsed, target: str) -> Dict[str, Any]:
         "mmproj": p.fields.get("mmproj", ""),
         "enabled": True,
         "runtime": config.KVMEM_RUNTIME if target == "kvmem" else "",
-        "kvmem_port": "",
+        # **不设置 kvmem_port。** bat 的 --port 只进导入报告 (端口统一读
+        # config.port), 所以这个字段不是 bat 的产物。以前这里写死 "" ,
+        # 覆盖已有档位时就把用户手工设的 kvmem_port 清掉 —— 三个 bat 覆盖
+        # 同一个档位, 于是出现「被命中的档位端口空了、没命中的档位还留着」
+        # 这种自相矛盾的结果。新建档位时 config.load() 的规范化会补 ""。
         "params": {},
     }
 
@@ -437,14 +442,21 @@ def apply_to_config(cfg: Dict[str, Any], model: Dict[str, Any],
     后者是为了不凭空多出一个重复档位 (kvmem 三档共用一个 gguf,
     光看路径分不出谁是谁)。返回 (是否新建, 覆盖原因)。"""
     models = cfg.setdefault("models", [])
+    # 匹配池: 默认就是实时的 models, 但 import_bats 会传入**批次开始前的快照**。
+    # 为什么要快照: 匹配打分依赖 _MATCH_KEYS (kvmem-budget / ctx-size /
+    # gen-reserve / reasoning-budget), 而合并会把这些字段改成当前 bat 的值。
+    # 于是同一批里第二个 bat 看到的是「被第一个 bat 改过」的档位, 打分结果
+    # 取决于 bat 之间的先后 -> 再导入一次匹配对象就漂移了, 幂等性被破坏。
+    # 对快照匹配 = 这一批里每个 bat 都基于同一份初始状态做决定, 结果稳定。
+    match_pool = cfg.get("__match_pool__") if cfg.get("__match_pool__") is not None else models
     idx, reason = -1, "new"
-    for i, m in enumerate(models):
+    for i, m in enumerate(match_pool):
         if m.get("id") == model.get("id"):
             idx, reason = i, "id"
             break
     if idx < 0:
         best_i, best_s = -1, 0
-        for i, m in enumerate(models):
+        for i, m in enumerate(match_pool):
             if m.get("runtime", "") != model.get("runtime", ""):
                 continue
             s = _match_score(m, model)
@@ -455,6 +467,9 @@ def apply_to_config(cfg: Dict[str, Any], model: Dict[str, Any],
 
     if idx < 0:
         models.append(model)
+        # 新建的同步进匹配池, 保持与 models 的下标一一对应
+        if match_pool is not models:
+            match_pool.append(model)
         added = True
     else:
         old = models[idx] or {}
@@ -462,7 +477,18 @@ def apply_to_config(cfg: Dict[str, Any], model: Dict[str, Any],
             # 保留原来的 id/alias, 否则 kvmem.active_id 会失效
             model["id"] = old.get("id") or model["id"]
             model["alias"] = old.get("alias") or model["alias"]
-        models[idx] = model
+        # **合并, 不是整体替换。** 直接 `models[idx] = model` 会把旧条目里
+        # bat 根本没有的字段全部抹掉 (用户写的 _note / api_key / base_url /
+        # 手工调过的 draft_* …)。三个 bat 指向同一个 gguf 时会反复覆盖同一档位,
+        # 于是「导一次丢一批用户数据」, 而且导两次和导一次结果不同 ——
+        # 幂等性直接被破坏。改成: bat 提供的字段覆盖, bat 没提供的保留旧的。
+        merged = dict(old)
+        merged.update(model)
+        # params 同理按 key 合并, 否则整个参数字典被换成 bat 的那份
+        _op = dict(old.get("params") or {})
+        _op.update(model.get("params") or {})
+        merged["params"] = _op
+        models[idx] = merged
         added = False
 
     # server (bat 的 --host/--port) 不写回配置: 主池与 KVMem 分支已统一
@@ -583,9 +609,16 @@ def import_bat(cfg: Dict[str, Any], path: str) -> Dict[str, Any]:
 
 def import_bats(cfg: Dict[str, Any], paths: List[str]) -> List[Dict[str, Any]]:
     out = []
-    for p in paths:
-        try:
-            out.append(import_bat(cfg, p))
-        except Exception as e:
-            out.append({"path": p, "error": str(e), "notes": [], "unknown": []})
+    # 批次开始前拍一份匹配快照 (见 apply_to_config 里的说明)。同一批里多个
+    # bat 指向同一个 gguf 时, 它们必须基于同一份初始状态做匹配决策, 否则
+    # 谁先谁后会互相改写 _MATCH_KEYS, 导致重复导入的结果和第一次不一致。
+    cfg["__match_pool__"] = json.loads(json.dumps(cfg.get("models") or []))
+    try:
+        for p in paths:
+            try:
+                out.append(import_bat(cfg, p))
+            except Exception as e:
+                out.append({"path": p, "error": str(e), "notes": [], "unknown": []})
+    finally:
+        cfg.pop("__match_pool__", None)
     return out
