@@ -1,7 +1,7 @@
 # llama.cpp Router 管理工具
 
-[![Release](https://img.shields.io/github/v/release/YOUR_GITHUB_USER/llama-router-setup)](https://github.com/YOUR_GITHUB_USER/llama-router-setup/releases)
-[![License](https://img.shields.io/github/license/YOUR_GITHUB_USER/llama-router-setup)](LICENSE)
+[![Release](https://img.shields.io/github/v/release/loushijushi/llama-router-setup)](https://github.com/loushijushi/llama-router-setup/releases)
+[![License](https://img.shields.io/github/license/loushijushi/llama-router-setup)](LICENSE)
 
 一个可视化的 [llama.cpp](https://github.com/ggml-org/llama.cpp) `llama-server --models-preset` 路由模式管理工具。
 
@@ -14,10 +14,10 @@
 
 ## 📥 下载安装
 
-去 [**Releases 页面**](https://github.com/YOUR_GITHUB_USER/llama-router-setup/releases) 下载最新版本的 zip 包（当前 `v0.1.1`，约 200 KB）：
+去 [**Releases 页面**](https://github.com/loushijushi/llama-router-setup/releases) 下载最新版本的 zip 包（当前 `v0.1.1`，约 200 KB）：
 
 ```
-llama-router-setup-v0.1.1.zip
+llama-router-setup-v0.2.0.zip
 ```
 
 解压到任意目录（**不要**有中文路径），双击 `manager-ui.bat` 即可。
@@ -180,13 +180,13 @@ Strata 的参数**不在** `config.json` 里，而是全在 `C:\Strata\strata-<�
 ### 安装
 
 1. **下载 zip 包**（推荐大多数用户）
-   - 去 [Releases](https://github.com/YOUR_GITHUB_USER/llama-router-setup/releases) 下载最新版本
+   - 去 [Releases](https://github.com/loushijushi/llama-router-setup/releases) 下载最新版本
    - 解压到任意目录（**路径不要有中文**）
    - 双击 `manager-ui.bat` 启动
 
    或用 git:
    ```bash
-   git clone https://github.com/YOUR_GITHUB_USER/llama-router-setup.git
+   git clone https://github.com/loushijushi/llama-router-setup.git
    cd llama-router-setup
    ```
 
@@ -366,21 +366,21 @@ A: 项目目录路径有中文一般没事，但**强烈建议安装到纯英文
 
 ### 克隆开发版
 ```bash
-git clone https://github.com/YOUR_GITHUB_USER/llama-router-setup.git
+git clone https://github.com/loushijushi/llama-router-setup.git
 cd llama-router-setup
 ```
 
 ### 本地打 zip 包
 ```bash
 py build_release.py                 # 使用 VERSION 文件里的版本
-py build_release.py --version 0.1.1 # 指定版本
+py build_release.py --version 0.2.0 # 指定版本
 py build_release.py --no-config     # 不带 config.example.json
 ```
 输出在 `dist/` 目录。
 
 ### 发布新版本到 GitHub Releases
 
-**当前约定**：版本号遵循语义化版本 (SemVer)。已发布 `v0.1.1`，后续按 `v0.1.x` 或 `v1.0.0` 递增。
+**当前约定**：版本号遵循语义化版本 (SemVer)。已发布 `v0.2.0`（移除 FreeToken 的破坏性版本），后续按 `v0.2.x` 递增。
 
 发布流程：
 1. 修改 `VERSION` 文件
@@ -392,7 +392,7 @@ py build_release.py --no-config     # 不带 config.example.json
    ```
 3. 推 tag 触发自动发布：
    ```bash
-    git tag v0.1.1
+    git tag v0.2.0
     git push --tags
    ```
 4. GitHub Actions 自动：
@@ -400,7 +400,7 @@ py build_release.py --no-config     # 不带 config.example.json
    - 验证 zip 生成
    - 创建 GitHub Release（自动生成 changelog）
    - 上传 zip 作为 binary
-5. 几分钟后在 https://github.com/YOUR_GITHUB_USER/llama-router-setup/releases 看到
+5. 几分钟后在 https://github.com/loushijushi/llama-router-setup/releases 看到
 
 ### 首次发布到 GitHub
 如果是第一次从本地推到 GitHub，运行 `publish_to_github.bat`，按提示操作。
