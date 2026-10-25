@@ -307,23 +307,14 @@ PARAM_SCHEMA: List[Dict[str, Any]] = [
           description=_D("每张图最多占多少 token。")),
     Param("mtmd-batch-max-tokens", "多模态批 tokens", "1024", kind="int", scope="model", category="advanced",
           description=_D("多模态编码时一次最多处理多少 image token。")),
-    # ============== 推测解码 ==============
-    # 这组的 scope 有两种, 原因在二进制本身, 不是 UI 偏好:
-    #   * 主池 llama-server (b11200) 支持**独立草稿模型** —— spec-draft-* 一整组都在;
-    #   * KVMem 分支 llama-kvmem-server 的 --help 里 spec/MTP flag **只有 4 个**:
-    #       --spec-type / --spec-draft-n-max / --spec-draft-p-min / --spec-kv-dtype
-    #     官方 README 明写 "independent draft models remain unsupported"
-    #     —— 它没有独立草稿模型的概念, 所以草稿路径 / GPU 层数 / 设备 / 线程 /
-    #     n-min / p-split / 草稿 KV 量化 / 后端采样这些 flag 在它 --help 里
-    #     **一个都没有**, 传进去只会被跳过 (勾了也是静默失效)。
-    # 因此那 10 个改成 scope="pool" (主池专用): 主池照常写进 router-preset.ini,
-    # KVMem 页与 KVMem 分支不再产出 (见 POOL_ONLY_SPEC_KEYS / KVMEM_SPEC_KEYS)。
-    # 主池仍然需要它们, 所以一个都不能删, 只能限定作用域。
-    #
-    # ⚠ 别把 kvmem 的 --spec-kv-dtype 和上游的 --spec-draft-type-k/-v 混用:
-    #   上游是 K、V **各一个** flag; kvmem 是**单个** --spec-kv-dtype (K/V 一起)。
-    #   前三个 (spec-type / n-max / p-min) 两边同名同义, 可以共用。
-    Param("spec-type", "推测类型", "", kind="choice", scope="model", category="common",
+    # ============== 推测解码 (主池 llama-server) ==============
+    # 这一组只服务主池 llama-server (b11200) 的**独立草稿模型** —— spec-draft-*
+    # 一整组都在。KVMem 分支 v0.18.0 (ninfer) 的推测解码是另一套方言
+    # (--spec / --draft-tokens / --adaptive-mtp / --ngram-*), 属于 scope="kvmem",
+    # 见上面「KVMem 分支」段; 老 llama-kvmem-server 的 4 个 spec flag 已废弃。
+    # 下面这组里 KVMem 分支 --help 没有的一律 scope="pool": 主池照常写进
+    # router-preset.ini, KVMem 页与 KVMem 分支不再产出 (见 POOL_SCOPED_KEYS)。
+    Param("spec-type", "推测类型", "", kind="choice", scope="pool", category="common",
           hint="draft-mtp / draft-dflash / draft-dflash2 / draft-dspark / ngram-*",
           description=_D("推测解码类型。MTP/DFlash/DFlash2 模型自动识别。")),
     # -- 以下 10 项 kvmem 分支的二进制**不认识** (见上面的说明), 只能主池用 --
@@ -340,18 +331,16 @@ PARAM_SCHEMA: List[Dict[str, Any]] = [
           description=_D("草稿模型用哪个 GPU (如 0)。留空自动。\n"
                          "⚠ 主池 llama-server 专用 —— kvmem 分支没有独立草稿模型。\n"
                          "仅在「启用推测解码」勾选且本项也勾选时才写入 preset。")),
-    Param("spec-draft-n-max", "草稿最大 token", "3", kind="int", scope="model", category="advanced",
-          description=_D("每轮推测最多生成多少个候选 token。\n"
-                         "kvmem 分支的同义 flag: --spec-draft-n-max (默认 3)。")),
+    Param("spec-draft-n-max", "草稿最大 token", "3", kind="int", scope="pool", category="advanced",
+          description=_D("每轮推测最多生成多少个候选 token (--spec-draft-n-max)。")),
     Param("spec-draft-n-min", "草稿最小 token", "0", kind="int", scope="pool", category="advanced",
           description=_D("少于这个数不触发验证。\n"
                          "⚠ 主池 llama-server 专用 —— kvmem 分支的 --help 里没有这一项。")),
     Param("spec-draft-p-split", "草稿拆分概率", "0.1", kind="float", scope="pool", category="advanced",
           description=_D("触发推测的拆分概率阈值。\n"
                          "⚠ 主池 llama-server 专用 —— kvmem 分支的 --help 里没有这一项。")),
-    Param("spec-draft-p-min", "草稿最小概率", "0.0", kind="float", scope="model", category="advanced",
-          description=_D("贪心模式下的最小接受概率。\n"
-                         "kvmem 分支的同义 flag: --spec-draft-p-min (默认 0)。")),
+    Param("spec-draft-p-min", "草稿最小概率", "0.0", kind="float", scope="pool", category="advanced",
+          description=_D("贪心模式下的最小接受概率 (--spec-draft-p-min)。")),
     Param("spec-draft-threads", "草稿 CPU 线程", "", kind="int", scope="pool", category="advanced",
           hint="需启用推测解码",
           description=_D("草稿模型用的 CPU 线程数。留空跟随主模型。\n"
@@ -365,27 +354,18 @@ PARAM_SCHEMA: List[Dict[str, Any]] = [
     Param("spec-draft-type-k", "草稿 KV K", "f16", kind="choice", scope="pool", category="advanced",
           hint="需启用推测解码",
           description=_D("草稿模型的 K 缓存量化 (llama-server: --spec-draft-type-k)。f16 即可。\n"
-                         "⚠ 主池 llama-server 专用 —— kvmem 分支改用单个 --spec-kv-dtype (K/V 一起)。\n"
+                         "⚠ 主池 llama-server 专用 —— KVMem 分支 (ninfer) 的 KV 精度用 --kv-dtype。\n"
                          "仅在「启用推测解码」勾选且本项也勾选时才写入 preset。")),
     Param("spec-draft-type-v", "草稿 KV V", "f16", kind="choice", scope="pool", category="advanced",
           hint="需启用推测解码",
           description=_D("草稿模型的 V 缓存量化 (llama-server: --spec-draft-type-v)。\n"
-                         "⚠ 主池 llama-server 专用 —— kvmem 分支改用单个 --spec-kv-dtype (K/V 一起)。\n"
+                         "⚠ 主池 llama-server 专用 —— KVMem 分支 (ninfer) 的 KV 精度用 --kv-dtype。\n"
                          "仅在「启用推测解码」勾选且本项也勾选时才写入 preset。")),
     Param("spec-draft-backend-sampling", "草稿后端采样", "true", kind="bool", scope="pool", category="advanced",
           hint="需启用推测解码",
           description=_D("把草稿采样放到后端 (默认 true)。\n"
                          "⚠ 主池 llama-server 专用 —— kvmem 分支没有独立草稿模型。\n"
-                         "仅在「启用推测解码」勾选且本项也勾选时才写入 preset。")),
-    Param("spec-kv-dtype", "草稿 KV 类型", "f16", kind="choice", scope="model", category="advanced",
-          hint="f16/f32/q8_0/q5_0/q4_0",
-          description=_D("MTP 草稿 (draft) 的 K/V 缓存精度 —— 等价于上游 llama-server 的\n"
-                         "草稿 KV 量化 (--spec-draft-type-k / --spec-draft-type-v)。\n"
-                         "⚠ 注意写法: kvmem 分支是**单个** --spec-kv-dtype (K 与 V 一起设),\n"
-                         "不是上游那种 K/V 分开的两个 flag, 两者不要混用。\n"
-                         "官方默认 f16; 主池 llama-server 的 --help 里没有这个 flag,\n"
-                         "生成 router-preset.ini 时会自动跳过。\n"
-                         "仅在「启用推测解码」勾选且本项也勾选时才写入。")),
+                          "仅在「启用推测解码」勾选且本项也勾选时才写入 preset。")),
     # ============== 杂项 ==============
     Param("warmup", "加载时预热", "true", kind="bool", scope="both", category="advanced",
           description=_D("加载完模型后空跑一次预热。")),
@@ -416,76 +396,261 @@ PARAM_SCHEMA: List[Dict[str, Any]] = [
           description=_D("开启 reranking 端点。")),
     Param("webui", "启用 Web UI", "true", kind="bool", scope="global", category="advanced",
           description=_D("内置 Web 聊天界面。")),
-    # ============== KVMem 分支 (llama-kvmem-server) ==============
+    # ============== KVMem 分支 (ninfer-kvmem-server, v0.18.0) ==============
     # scope="kvmem": 只在「⚡ KVMem」页的参数面板里出现, 不进全局页, 也
-    # 不进主路由的 router-preset.ini —— 主 llama-server (b11200) 不认识
-    # --kvmem-* 这些 flag, 写进去会让整个 preset 解析失败、所有模型都加载不了。
+    # 不进主路由的 router-preset.ini —— 主 llama-server 不认识 --kvmem-* /
+    # --kv-dtype 这些 flag, 写进去会让整个 preset 解析失败、所有模型都加载不了。
     # generate_preset.render() 里另有 runtime 闸门做兜底。
-    Param("kvmem", "启用 KVMem", "true", kind="bool", scope="kvmem", category="common",
-          description=_D("KVMem 分支总开关 (--kvmem / --no-kvmem)。\n"
-                         "关掉就退化成普通单槽 llama.cpp。")),
-    Param("kvmem-budget", "KVMem 预算 (token)", "24576", kind="int", scope="kvmem", category="common",
-          hint="0 = 用满整段 ctx",
-          description=_D("GPU 工作集 token 数 (--kvmem-budget)。\n"
-                         "越大越占显存, 但长文/长上下文越不容易掉出去。")),
-    Param("kvmem-gen-reserve", "生成预留 (token)", "12288", kind="int", scope="kvmem", category="common",
-          description=_D("decode 阶段预留的余量 (--kvmem-gen-reserve)。\n"
-                         "留得越少越省显存, 但太小会让生成变慢或失败。")),
-    Param("kvmem-block-tokens", "分块大小 (token)", "128", kind="int", scope="kvmem", category="advanced",
-          description=_D("KVMem 分块粒度 (--kvmem-block-tokens)。")),
-    Param("kvmem-gpu-ratio", "slot pool 显存占比", "0.50", kind="text", scope="kvmem",
+    #
+    # 键名与 ninfer-kvmem-server 的 CLI flag **一一对应** (去掉 --), 由
+    # kvmem._build_args_ninfer 按白名单产出。ninfer 方言与老 llama-kvmem-server
+    # 不同: 模型是位置参数、视觉塔内嵌 (.ninfer, 无 --mmproj)、--kv-dtype 单值、
+    # 淘汰策略改用 LRFU。整表即 config.KVMEM_SCOPED_KEYS 的集合。
+    Param("max-context", "上下文上限 (token)", "262144", kind="int", scope="kvmem", category="common",
+          description=_D("单请求的逻辑上下文上限 (--max-context)。\n"
+                         "决定 prompt 最长能到多少 token。")),
+    Param("kvmem-budget", "KVMem 工作集 (token)", "20480", kind="int", scope="kvmem", category="common",
+          hint="64 对齐",
+          description=_D("GPU 常驻历史 token 数 B (--kvmem-budget, 64 对齐)。\n"
+                         "越大越占显存, 但长文越不容易掉出工作集。")),
+    Param("kvmem-gen-reserve", "生成预留 (token)", "8192", kind="int", scope="kvmem", category="common",
+          hint="64 对齐",
+          description=_D("decode 阶段追加工作区 R (--kvmem-gen-reserve, 64 对齐)。\n"
+                         "⚠ 与 B 之和决定能否加载 —— 本机 RTX 5080 实测 B+R ≤ ~30000。")),
+    Param("kv-dtype", "KV 存储精度", "int8", kind="choice", scope="kvmem", category="common",
+          description=_D("KV 存储类型 (--kv-dtype)。\n"
+                         "bf16 默认; int8/fp8 省显存; rk*/nvfp4/k8v4 为压缩格式。")),
+    Param("spec", "推测解码后端", "mtp", kind="choice", scope="kvmem", category="common",
+          description=_D("speculative decoding backend (--spec): mtp / dflash / dflash2。")),
+    Param("draft-tokens", "每轮草稿数", "4", kind="int", scope="kvmem", category="common",
+          hint="1..15",
+          description=_D("每轮草稿 token 数 (--draft-tokens, 1..15)。")),
+    Param("default-thinking-budget", "思考预算上限 (token)", "8192", kind="int", scope="kvmem",
+          category="common", hint="0 = 不思考",
+          description=_D("模型自发出思考时的默认预算上限 (--default-thinking-budget)。\n"
+                         "客户端仍可用 reasoning_effort 按请求覆盖。")),
+    Param("prefill-chunk", "Prefill 分块 (token)", "1024", kind="int", scope="kvmem", category="advanced",
+          hint="128 的倍数",
+          description=_D("prefill 分块大小 (--prefill-chunk, 128 的倍数)。")),
+    Param("max-concurrency", "并发解码请求", "1", kind="int", scope="kvmem", category="advanced",
+          hint="1..8",
+          description=_D("同时解码的请求数 (--max-concurrency, 1..8)。")),
+    Param("kvmem-sessions", "保留历史会话", "1", kind="int", scope="kvmem", category="advanced",
+          hint="1..16",
+          description=_D("保留的 Host 历史数 (--kvmem-sessions, 1..16)。")),
+    Param("default-max-tokens", "默认最大输出 (token)", "16384", kind="int", scope="kvmem",
           category="advanced",
-          description=_D("slot pool 上限占 GPU 显存的份额 (--kvmem-gpu-ratio)。\n"
-                         "默认值 0.50 是保守值; 显存有余时可以调高,\n"
-                         "让更多 KV 块留在显存里, 长上下文更快。")),
-    Param("kvmem-cpu-gb", "CPU 溢出区 (GiB)", "0", kind="int", scope="kvmem",
-          category="advanced",
-          hint="0 = 关闭",
-          description=_D("CPU 溢出区大小 (--kvmem-cpu-gb)。\n"
-                         "默认 0 = 关闭 —— 关着就没有 CPU 侧承接,\n"
-                         "超出显存的 KV 只能整个失败。\n"
-                         "物理内存够就开大, 长上下文才撑得住。")),
-    Param("kvmem-nvme-gb", "NVMe 溢出区 (GiB)", "0", kind="int", scope="kvmem",
-          category="advanced",
-          hint="0 = 关闭",
-          description=_D("NVMe 溢出区大小 (--kvmem-nvme-gb)。\n"
-                         "比 CPU 区慢, 但容量便宜; 超长上下文兜底用。")),
-    Param("kvmem-sink-tokens", "常驻前缀 (token)", "0", kind="int", scope="kvmem",
-          category="advanced",
-          hint="0 = 一个块",
-          description=_D("永远保留的前缀 (--kvmem-sink-tokens)。\n"
+          description=_D("请求未指定 max_tokens 时的输出上限 (--default-max-tokens)。")),
+    Param("kvmem-host-mib", "Host KV 预算 (MiB)", "12288", kind="int", scope="kvmem", category="advanced",
+          description=_D("Host 原生 KV 载荷预算 H, MiB (--kvmem-host-mib)。")),
+    Param("kvmem-sink-tokens", "常驻前缀 (token)", "8192", kind="int", scope="kvmem",
+          category="advanced", hint="0 = 一个页",
+          description=_D("永远保留的前缀 (--kvmem-sink-tokens, 默认 0 = 一个 64-token 页)。\n"
                          "系统提示放这里, 长对话里不会被挤掉导致跑题。")),
-    Param("kvmem-recent-tokens", "常驻近期 (token)", "0", kind="int", scope="kvmem",
+    Param("kvmem-recent-tokens", "常驻近期 (token)", "1024", kind="int", scope="kvmem",
           category="advanced",
-          hint="0 = 不保留",
-          description=_D("永远保留的最近后缀 (--kvmem-recent-tokens)。\n"
+          description=_D("永远保留的最近后缀 (--kvmem-recent-tokens, 默认 64 = 一页)。\n"
                          "保证刚才说过的话在任何淘汰策略下都不丢。")),
-    Param("kvmem-query-max-tokens", "检索 query 上限", "0", kind="int", scope="kvmem",
+    Param("kvmem-lrfu", "LRFU 淘汰", "true", kind="bool", scope="kvmem", category="advanced",
+          description=_D("按衰减后的检索历史排序要保留的块 (--kvmem-lrfu)。\n"
+                         "取代了老版本的 --kvmem-method / --kvmem-query-policy。")),
+    Param("kvmem-lrfu-lambda", "LRFU 衰减系数", "0.5", kind="text", scope="kvmem", category="advanced",
+          hint="0..1",
+          description=_D("历史衰减 (--kvmem-lrfu-lambda, [0,1], 默认 0.5)。")),
+    Param("kvmem-lrfu-top-frac", "LRFU 命中比例", "0.9", kind="text", scope="kvmem", category="advanced",
+          hint="(0,1]",
+          description=_D("命中比例 (--kvmem-lrfu-top-frac, (0,1], 默认 0.9)。")),
+    Param("kvmem-score-agg", "打分聚合方式", "max", kind="choice", scope="kvmem", category="advanced",
+          description=_D("GQA 头间聚合 (--kvmem-score-agg): mean / max。")),
+    Param("ngram-draft-tokens", "N-gram 复制上限", "31", kind="int", scope="kvmem", category="advanced",
+          hint="1..63",
+          description=_D("每轮最多复制 N 个 token (--ngram-draft-tokens, 1..63)。")),
+    Param("ngram-min-match", "N-gram 最短匹配", "12", kind="int", scope="kvmem", category="advanced",
+          hint="4..64",
+          description=_D("复制所依据的最短匹配长度 (--ngram-min-match, 4..64)。")),
+    Param("adaptive-mtp", "自适应 MTP", "true", kind="bool", scope="kvmem", category="advanced",
+          description=_D("每轮 MTP 校验 3..draft-tokens 个 (--adaptive-mtp)。")),
+    Param("vision", "启用视觉", "true", kind="bool", scope="kvmem", category="advanced",
+          description=_D("接受图像/视频并加载视觉塔 (--vision)。\n"
+                         "ninfer 的视觉塔内嵌在 .ninfer 里, 没有 --mmproj。")),
+    Param("vision-residency", "视觉塔驻留", "cpu", kind="choice", scope="kvmem", category="advanced",
+          description=_D("视觉塔驻留方式 (--vision-residency):\n"
+                         "resident = 常驻显存; overlay = 借显存 (别名 --vision-offload);\n"
+                         "cpu = 跑在 CPU 线程 (无设备视觉显存)。")),
+    Param("vision-max-merged", "单图合并上限", "1024", kind="int", scope="kvmem", category="advanced",
+          hint="64..16384",
+          description=_D("单个媒体项的合并 token 上限 (--vision-max-merged, 64..16384)。")),
+    Param("device-profile", "设备调优档", "off", kind="choice", scope="kvmem", category="advanced",
+          description=_D("设备调优档 (--device-profile): auto / off / calibrate。")),
+    Param("no-thinking", "默认关闭思考", "false", kind="bool", scope="kvmem", category="advanced",
+          description=_D("默认不思考 (--no-thinking)。\n"
+                         "客户端可用 reasoning_effort 按请求覆盖。")),
+    Param("fast-prefill-kernel", "快速 prefill 内核", "false", kind="bool", scope="kvmem",
           category="advanced",
-          hint="0 = 不限",
-          description=_D("检索 query 截断上限 (--kvmem-query-max-tokens)。\n"
-                         "太小会让超长问题检索偏题。")),
-    Param("kvmem-query-policy", "检索查询策略", "user", kind="choice", scope="kvmem", category="advanced",
-          description=_D("检索 query来源 (--kvmem-query-policy):\n"
-                         "user = 只拿最后一条用户消息当 query (推荐);\n"
-                         "legacy = 旧行为。")),
-    Param("kvmem-method", "KVMem 淘汰算法", "retrieval", kind="choice", scope="kvmem", category="advanced",
-          description=_D("--kvmem-method: retrieval 按相关性挑要保留的块,\n"
-                         "recency 按新近度保留。")),
-    Param("enable-thinking", "开启思考", "false", kind="bool", scope="kvmem", category="common",
-          description=_D("强制打开思维链 (--enable-thinking)。\n"
-                         "配合「思维预算」(reasoning-budget) 使用, 预算 0 = 不思考。")),
-    Param("ui-dir", "自定义 UI 目录", r"..\share\kvmem\ui", kind="text", scope="kvmem", category="advanced",
-          hint="相对 bin 目录",
-          description=_D("--ui-dir: 静态聊天界面目录。--webui 始终开启。")),
-    Param("verbosity", "日志详细度", "3", kind="int", scope="kvmem", category="advanced",
-          description=_D("--verbosity: 0~5, 越大日志越多。")),
+          description=_D("用快速内核 prefill int8 / rk* KV (--fast-prefill-kernel)。")),
+    Param("gdn-state-fp16", "GDN 状态 FP16", "false", kind="bool", scope="kvmem", category="advanced",
+          description=_D("GDN 循环状态用 FP16 (--gdn-state-fp16, 省一半显存)。")),
+    Param("media-cache-mib", "媒体缓存 (MiB)", "1024", kind="int", scope="kvmem", category="advanced",
+          hint="0 = 关闭",
+          description=_D("保留已准备的媒体 (--media-cache-mib, 默认 1024, 0 关闭)。")),
+    Param("wddm-evictable-budget", "WDDM 可回收预算", "true", kind="bool", scope="kvmem",
+          category="advanced",
+          description=_D("按专用显存预算并把权重 arena 标为可回收 "
+                         "(--wddm-evictable-budget)。\n"
+                         "WDDM 下显存紧张时也能加载 —— 权重借可回收的共享内存, "
+                         "代价是压力大时解码可能变慢。\n"
+                         "关掉后引擎退回「专用显存严格规划」, 空闲显存不足会\n"
+                         "直接 FATAL 拒绝启动。本机 RTX 5080 16GB 实测: 关掉需\n"
+                         "≥14.3 GiB 空闲才加载; 开启后 ~12.8 GiB 空闲即可加载。")),
+
+    # ============== KVMem 分支 (老 llama-kvmem-server, v0.16) ==============
+    # 与上面的 ninfer 新引擎**并存**: 同一份 schema, 靠 engine 标记区分
+    # (见下面的分组代码)。这批 flag 只有老 llama.cpp 引擎认识 —— ninfer
+    # 的 --help 里一个都没有, 所以只给老档位产出 (kvmem._build_args_llama)。
+    Param("kvmem", "启用 KVMem", "true", kind="bool", scope="kvmem", category="common",
+          description=_D("打开 KVMem 工作集管理 (--kvmem / --no-kvmem, 默认开)。")),
+    Param("kvmem-block-tokens", "块大小 (token)", "128", kind="int", scope="kvmem",
+          category="common", hint="默认 128",
+          description=_D("KVMem 分块粒度 (--kvmem-block-tokens, 默认 128)。")),
+    Param("enable-thinking", "默认开启思考", "false", kind="bool", scope="kvmem",
+          category="common",
+          description=_D("Qwen 思考默认打开 (--enable-thinking, 默认关; 请求可覆盖)。")),
+    Param("kvmem-query-policy", "检索查询策略", "user", kind="choice", scope="kvmem",
+          category="common",
+          description=_D("用最后一条 user 消息做检索查询 (--kvmem-query-policy):\n"
+                         "user = 取最后 user span (默认); legacy = 旧行为。")),
+    Param("kvmem-method", "淘汰策略", "retrieval", kind="choice", scope="kvmem",
+          category="advanced",
+          description=_D("保留哪些块 (--kvmem-method): recency / retrieval (默认)。")),
+    Param("kvmem-query-last", "查询回退长度", "64", kind="int", scope="kvmem",
+          category="advanced",
+          description=_D("最后 user span 缺失时的回退查询长度 (--kvmem-query-last, 默认 64)。")),
+    Param("kvmem-query-max-tokens", "查询长度上限 (token)", "0", kind="int", scope="kvmem",
+          category="advanced", hint="0 = 不限",
+          description=_D("把 last-user 检索查询截到这么多 token (--kvmem-query-max-tokens)。")),
+    Param("kvmem-query-replay", "查询回放模式", "auto", kind="choice", scope="kvmem",
+          category="advanced",
+          description=_D("检索查询的回放方式 (--kvmem-query-replay): legacy / auto (默认)。")),
+    Param("kvmem-mtp-state", "MTP 状态模式", "replay", kind="choice", scope="kvmem",
+          category="advanced",
+          description=_D("MTP 状态处理 (--kvmem-mtp-state): snapshots / auto /\n"
+                         "replay (默认, 配 MTP 用)。")),
+    Param("kvmem-gpu-ratio", "GPU 池占比", "0.50", kind="text", scope="kvmem",
+          category="advanced", hint="(0,1]",
+          description=_D("槽池显存上限占整卡比例 (--kvmem-gpu-ratio, 默认 0.50)。")),
+    Param("kvmem-cpu-gb", "CPU 溢写 (GiB)", "0", kind="text", scope="kvmem",
+          category="advanced", hint="0 = 关",
+          description=_D("CPU 溢写区大小 GiB (--kvmem-cpu-gb, 0 = 关)。\n"
+                         "显存不够时把工作集溢出到内存, 不换引擎就能跑更长上下文。")),
+    Param("kvmem-nvme-gb", "NVMe 溢写 (GiB)", "0", kind="text", scope="kvmem",
+          category="advanced", hint="0 = 关",
+          description=_D("NVMe 文件大小 GiB (--kvmem-nvme-gb, 0 = 关)。")),
+    Param("kvmem-nvme-dir", "NVMe 目录", "", kind="text", scope="kvmem", category="advanced",
+          description=_D("NVMe 溢写目录 (--kvmem-nvme-dir, 默认 /tmp/kvmem_nvme)。")),
+    Param("kvmem-harvest-v", "回收 V 到内存", "false", kind="bool", scope="kvmem",
+          category="advanced",
+          description=_D("prefill 时把 V 回收进内存 (--kvmem-harvest-v, 默认关)。")),
+    Param("kvmem-raw-k-nvme", "原样 KV 存 NVMe", "false", kind="bool", scope="kvmem",
+          category="advanced",
+          description=_D("把原始 K/V 存 NVMe (--kvmem-raw-k-nvme, 需 --kvmem-nvme-gb)。")),
+    Param("spec-kv-dtype", "MTP KV 精度", "f16", kind="choice", scope="kvmem",
+          category="advanced",
+          description=_D("MTP 草稿 KV 类型 (--spec-kv-dtype, 默认 f16)。")),
+    Param("ui-dir", "内置 UI 目录", "", kind="text", scope="kvmem", category="advanced",
+          description=_D("从该目录提供静态聊天 UI (--ui-dir)。")),
+    Param("verbosity", "日志级别", "3", kind="int", scope="kvmem", category="advanced",
+          hint="0..5",
+          description=_D("日志级别 (--verbosity, 0 静默 .. 5 调试, 默认 3)。")),
 ]
+
+# ----------------------------------------------------------------------
+# 两套 KVMem 引擎并存 (engine 标记)
+# ----------------------------------------------------------------------
+# 开关型 KVMem 分支有两个引擎 (引擎由档位的模型工件后缀决定, 见 model_engine):
+#   * KV_ENGINE_LLAMA  = 老 llama-kvmem-server (v0.16, 吃 .gguf + --mmproj),
+#                        支持 GPU/CPU/NVMe 分层, 上面新加的 --kvmem-* 就是它的;
+#   * KV_ENGINE_NINFER = ninfer-kvmem-server (v0.18.0, 吃 .ninfer 单文件),
+#                        flag 方言不同 (位置参数 / --kv-dtype / LRFU ...)。
+# 两边同名同义的键 (engine 留空) 共用一份, UI 与命令行都两边可见。
+KV_ENGINE_LLAMA = "llama"
+KV_ENGINE_NINFER = "ninfer"
+KV_ENGINES = (KV_ENGINE_LLAMA, KV_ENGINE_NINFER)
+
+# 两引擎共享 (flag 名/语义一致) 的 scope="kvmem" 键。
+_KV_SHARED_KEYS = frozenset({
+    "kvmem-budget", "kvmem-gen-reserve", "kvmem-sink-tokens", "kvmem-recent-tokens",
+})
+
+# 老 llama-kvmem-server 专属的 scope="kvmem" 键 (上面那批)。
+_KV_LLAMA_KEYS = frozenset({
+    "kvmem", "kvmem-block-tokens", "kvmem-method", "kvmem-query-last",
+    "kvmem-query-max-tokens", "kvmem-query-replay", "kvmem-query-policy",
+    "kvmem-mtp-state", "kvmem-gpu-ratio", "kvmem-cpu-gb", "kvmem-nvme-gb",
+    "kvmem-nvme-dir", "kvmem-harvest-v", "kvmem-raw-k-nvme",
+    "enable-thinking", "spec-kv-dtype", "ui-dir", "verbosity",
+})
+
+# 给每条 scope="kvmem" 参数打 engine 标记 (没在上面两份名单里的按 ninfer 处理)。
+for _p in PARAM_SCHEMA:
+    if _p.get("scope") != "kvmem":
+        continue
+    if _p["key"] in _KV_SHARED_KEYS:
+        _p["engine"] = ""
+    elif _p["key"] in _KV_LLAMA_KEYS:
+        _p["engine"] = KV_ENGINE_LLAMA
+    else:
+        _p["engine"] = KV_ENGINE_NINFER
+del _p
+
+
+def model_engine(m: Dict[str, Any]) -> str:
+    """档位属于哪套 KVMem 引擎: 显式 "engine" 字段优先, 否则按工件后缀推。
+
+    .ninfer -> ninfer 引擎; 其它 (.gguf 等) -> 老 llama 引擎。
+    """
+    m = m or {}
+    explicit = str(m.get("engine") or "").strip().lower()
+    if explicit in KV_ENGINES:
+        return explicit
+    if str(m.get("model") or "").strip().lower().endswith(".ninfer"):
+        return KV_ENGINE_NINFER
+    return KV_ENGINE_LLAMA
+
+
+def kvmem_keys_for_engine(engine: str) -> frozenset:
+    """该引擎「⚡KVMem」页能编辑的 scope="kvmem" 键 (engine 留空 = 两引擎共享)。"""
+    return frozenset(
+        p["key"] for p in PARAM_SCHEMA
+        if p.get("scope") == "kvmem" and p.get("engine", "") in ("", engine)
+    )
+
+
+# 「⚡KVMem」页在该引擎下能显示的 scope 集合: 老 llama.cpp 引擎还能显示
+# scope in (both, model) 的通用项 (ctx-size / cache-type-* / flash-attn ...);
+# ninfer 只认自己那套 kvmem flag。ui.py 据此按引擎切换面板。
+KV_PANEL_SCOPES_NINFER = frozenset({"kvmem"})
+KV_PANEL_SCOPES_LLAMA = frozenset({"kvmem", "both", "model"})
+
+
+def kvmem_panel_scopes(engine: str) -> frozenset:
+    return (KV_PANEL_SCOPES_LLAMA if engine == KV_ENGINE_LLAMA
+            else KV_PANEL_SCOPES_NINFER)
+
+
+def kvmem_panel_common_pool(engine: str) -> frozenset:
+    """该引擎面板「常用」区允许出现的 key 全集 (用于校验用户偏好)。"""
+    scopes = kvmem_panel_scopes(engine)
+    return frozenset(
+        p["key"] for p in PARAM_SCHEMA
+        if p.get("scope") in scopes
+        and (p.get("scope") != "kvmem" or p.get("engine", "") in ("", engine))
+    )
+
 
 SCHEMA_INDEX: Dict[str, Dict[str, Any]] = {p["key"]: p for p in PARAM_SCHEMA}
 
 # runtime 字段取值: 空串 = 走主路由 llama-server (b11200) 的模型池;
-# "kvmem" = 走 llama-kvmem-server 分支, 只由「⚡ KVMem」页托管。
+# "kvmem" = 走 KVMem 分支 (ninfer-kvmem-server), 只由「⚡ KVMem」页托管。
 # "strata" = 走 Strata 分支 (C:\Strata, 自带 OpenAI 兼容服务),
 # 只由「🌐 Strata」页托管; 它的参数全在 strata-<档位>.json 里, 不吃 llama flag。
 KVMEM_RUNTIME = "kvmem"
@@ -494,25 +659,29 @@ STRATA_RUNTIME = "strata"
 KVMEM_SCOPED_KEYS = frozenset(p["key"] for p in PARAM_SCHEMA if p["scope"] == "kvmem")
 
 # scope="pool" = **主池 llama-server 专用**, KVMem 页/分支一律不产出。
-# 起因是二进制能力差异 (不是 UI 偏好): llama-kvmem-server 的 --help 里 spec/MTP
-# flag 只有 4 个, 官方 README 明写 "independent draft models remain unsupported"
-# —— 没有独立草稿模型, 草稿路径/GPU 层数/设备/线程/n-min/p-split/草稿 KV 量化/
-# 后端采样这些 flag 一个都没有, 传进去只会被跳过。
-# 主池 b11200 仍然需要这 10 个, 所以只能限定作用域, 不能删。
+# 起因是二进制能力差异 (不是 UI 偏好): 主池 b11200 认独立草稿模型 (spec-draft-*
+# 一整组), 而 KVMem 分支 (ninfer) 的推测解码是另一套方言 --spec / --draft-tokens
+# / --adaptive-mtp / --ngram-* (那几条属于 scope="kvmem")。两套 flag 互不认识,
+# 传错了只会被跳过 —— 所以按二进制限定作用域, 主池仍需要这组, 一个都不能删。
 POOL_SCOPED_KEYS = frozenset(p["key"] for p in PARAM_SCHEMA if p["scope"] == "pool")
 
-# KVMem 分支二进制真实支持的 spec/MTP flag —— 逐个对过 llama-kvmem-server --help:
-#   --spec-type         none | draft-mtp
-#   --spec-draft-n-max  MTP draft tokens (默认 3)
-#   --spec-draft-p-min  min draft probability
-#   --spec-kv-dtype     MTP K/V type (默认 f16) —— K/V 合成**一个** flag
-# 草稿面板按工作区裁剪时以它为准 (见 ui.py 的 _draft_spec_keys)。
+# KVMem 分支 (ninfer) 的推测解码 (spec) 专属 key —— 全部 scope="kvmem"。
+# ninfer 的草稿是内建 MTP + 可选 ngram 复制, 没有独立草稿模型:
+#   --spec mtp|dflash|dflash2     后端
+#   --draft-tokens N              每轮草稿数
+#   --adaptive-mtp                自适应 (每轮 3..draft-tokens)
+#   --ngram-draft-tokens N        ngram 复制上限
+#   --ngram-min-match N           ngram 最短匹配
+# 保留这份集合只为「⚡KVMem」页的草稿相关判断; ninfer 命令行由
+# kvmem._build_args_ninfer 按 config.KVMEM_SCOPED_KEYS 白名单产出。
 KVMEM_SPEC_KEYS = frozenset({
-    "spec-type", "spec-draft-n-max", "spec-draft-p-min", "spec-kv-dtype",
+    "spec", "draft-tokens", "adaptive-mtp",
+    "ngram-draft-tokens", "ngram-min-match",
 })
 
 # 「推测解码」草稿面板 (draft_box) 专属的 key: 面板里已有控件,
 # 不在模型参数子表里重复出现 (子表那份会被 draft_* 顶层字段覆盖, 属于静默失效)。
+# 全是主池 llama-server 的独立草稿模型 flag —— 「⚡KVMem」页不再渲染草稿面板。
 #   DRAFT_BOX_KEYS == DRAFT_QUICK_KEYS | DRAFT_OPT_KEYS | {"spec-type"}
 DRAFT_BOX_KEYS = frozenset({
     "spec-type",
@@ -520,18 +689,13 @@ DRAFT_BOX_KEYS = frozenset({
     "spec-draft-p-split", "spec-draft-p-min", "spec-draft-ngl",
     "spec-draft-device", "spec-draft-threads", "spec-draft-threads-batch",
     "spec-draft-type-k", "spec-draft-type-v", "spec-draft-backend-sampling",
-    # kvmem 的 MTP K/V 类型 (单个 flag; 与上面的 type-k/-v 不是一回事)
-    "spec-kv-dtype",
 })
 
 # 草稿面板「高级」区的可选项: 各自带勾选框, 勾了才写入 ini。
-# 前 6 个是 scope="pool" 的主池专属项, KVMem 页不渲染 (ui.py 按工作区裁剪);
-# spec-kv-dtype 是 kvmem 分支唯一支持的草稿 KV 精度 flag, 主池也照常渲染
-# (主池 llama-server 不认识它, generate_preset 会按 known 自动跳过)。
+# 全是 scope="pool" 的主池专属项 (KVMem 页不渲染草稿面板)。
 DRAFT_OPT_KEYS = (
     "spec-draft-device", "spec-draft-threads", "spec-draft-threads-batch",
     "spec-draft-type-k", "spec-draft-type-v", "spec-draft-backend-sampling",
-    "spec-kv-dtype",
 )
 
 # 草稿面板「快捷」区直接显示的 7 个字段: 每个自带勾选框, 勾了才写入 ini。
@@ -567,7 +731,12 @@ MMKV_LOAD_KEYS = (
 MMKV_BOX_KEYS = frozenset(MMKV_VISION_KEYS + MMKV_KV_KEYS + MMKV_LOAD_KEYS)
 
 # schema 里已删除的 key -> 加载时从用户 params 里清掉 (否则会留在配置里当垃圾)。
-REMOVED_PARAM_KEYS = frozenset({"no-mmap"})
+# 老 llama-kvmem-server 的那批 kvmem flag 已随「双引擎并存」重新加回 schema
+# (engine=llama, 见上面的分组), 不再在这里丢弃 —— 之前迁到 ninfer 时被删掉,
+# 现在两个引擎都保留, 老档位 (kvmem-coding 等) 要照旧能跑。
+REMOVED_PARAM_KEYS = frozenset({
+    "no-mmap",
+})
 
 # 旧版 schema 里写错的 key -> llama-server 真正认识的 key。
 # 错的 key 会让整个 router-preset.ini 解析失败 (所有模型都加载不了)，故加载时自动迁移。
@@ -593,11 +762,18 @@ def _default_prefs() -> Dict[str, Any]:
         ],
         "extra_params": [],
         # 「⚡ KVMem」页参数面板里当「常用」显示的 key (其余进「扩展参数」折叠区)。
-        # 注意 cache-type-k/v、mmproj-offload 这些在「模型」页的独立区块里已有一份,
-        # 这里刻意不列 —— 同一条记录的同一个 key 全项目只出现一次。
+        # KVMem 分支 (ninfer) 有自己的一整套 flag, 与主池 llama 参数不通用,
+        # 所以这里刻意不混入主池的 ctx-size / parallel / jinja。
         "kvmem_common_keys": [
-            "kvmem-budget", "kvmem-gen-reserve", "enable-thinking",
-            "reasoning-budget", "ctx-size", "parallel", "jinja",
+            "kvmem-budget", "kvmem-gen-reserve", "max-context",
+            "kv-dtype", "spec", "draft-tokens", "default-thinking-budget",
+            "wddm-evictable-budget",
+        ],
+        # 老 llama-kvmem-server 引擎的「常用」清单 (方言不同, 单独一份)。
+        "kvmem_common_keys_llama": [
+            "kvmem-budget", "kvmem-gen-reserve", "ctx-size",
+            "kvmem-block-tokens", "enable-thinking",
+            "cache-type-k", "cache-type-v",
         ],
         # 监控窗口「监控地址」下拉里出现过的地址 (最近的在最前)
         "monitor_addr_history": [],
@@ -616,9 +792,18 @@ def load_prefs() -> Dict[str, Any]:
     base.update(data)
     if not isinstance(base.get("extra_params"), list):
         base["extra_params"] = []
-    if not isinstance(base.get("kvmem_common_keys"), list):
-        base["kvmem_common_keys"] = list(
-            _default_prefs()["kvmem_common_keys"])
+    # kvmem 常用项必须落在「⚡KVMem」页当前引擎的面板里 —— 两个引擎各有一份
+    # 清单 (ninfer 用 kvmem_common_keys, 老 llama 引擎用 kvmem_common_keys_llama)。
+    # 只要清单里出现过无效键 (说明是旧格式), 就整体回默认; 否则保留用户的自定义。
+    for field, engine in (("kvmem_common_keys", KV_ENGINE_NINFER),
+                          ("kvmem_common_keys_llama", KV_ENGINE_LLAMA)):
+        valid_kv = kvmem_panel_common_pool(engine)
+        raw_kv = base.get(field)
+        raw_kv = raw_kv if isinstance(raw_kv, list) else []
+        filtered_kv = [k for k in raw_kv if isinstance(k, str) and k in valid_kv]
+        if not filtered_kv or len(filtered_kv) != len(raw_kv):
+            filtered_kv = list(_default_prefs()[field])
+        base[field] = filtered_kv
     base["monitor_addr_history_max"] = _clean_addr_history_max(
         base.get("monitor_addr_history_max"))
     base["monitor_addr_history"] = _clean_addr_history(
@@ -665,12 +850,15 @@ def common_keys() -> List[str]:
     return list(load_prefs().get("common_keys", []))
 
 
-def kvmem_common_keys() -> List[str]:
-    """「⚡ KVMem」参数面板里当常用显示的 key。"""
-    keys = load_prefs().get("kvmem_common_keys")
-    if not isinstance(keys, list):
-        return list(_default_prefs()["kvmem_common_keys"])
-    return [k for k in keys if isinstance(k, str)]
+def kvmem_common_keys(engine: str = KV_ENGINE_NINFER) -> List[str]:
+    """「⚡ KVMem」参数面板里当常用显示的 key (两个引擎各有一份)。"""
+    field = ("kvmem_common_keys_llama" if engine == KV_ENGINE_LLAMA
+             else "kvmem_common_keys")
+    keys = load_prefs().get(field)
+    if not isinstance(keys, list) or not keys:
+        return list(_default_prefs()[field])
+    valid = set(kvmem_panel_common_pool(engine))
+    return [k for k in keys if isinstance(k, str) and k in valid]
 
 
 def extra_params() -> List[Dict[str, Any]]:
@@ -725,9 +913,10 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "enabled": False,
         "port": 8099,
     },
-    # KVMem 分支 (llama-kvmem-server): 单槽独立进程, 不进 router-preset.ini。
+    # KVMem 分支 (ninfer-kvmem-server): 单槽独立进程, 不进 router-preset.ini。
     #   install_dir/exe 留空 -> 运行时在 install_dir 下自动探测
-    #     llama-kvmem-server.exe (不写死版本号, 换包不用改配置)。
+    #     ninfer-kvmem-server.exe / llama-kvmem-server.exe (不写死版本号,
+    #     换 kvmem 发布包时不用改配置)。
     #   host/port 已废弃 (与主池统一): 运行时一律读顶层的 host/port。
     #   保留字段只为兼容老配置, 服务不再读它们, 档位的 kvmem_port 字段同理。
     # 网关 (gateway.py): 服务 llama-router 的进程本体, 占住顶层 host/port,
@@ -764,8 +953,14 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     },
     "kvmem": {
         "enabled": True,
+        # 老 llama-kvmem-server (engine=llama, 吃 .gguf + --mmproj) 的安装目录。
         "install_dir": r"C:\llama.cpp\kvmem-llama.cpp",
+        # ninfer-kvmem-server (engine=ninfer, 吃 .ninfer 单文件) 的安装目录。
+        # 两套引擎并存: 档位按模型工件后缀自动选 (见 model_engine / kvmem.find_exe)。
+        "ninfer_install_dir": r"D:\AI\kvmem\kvmem-v0.18.0-ninfer-windows-rtx50-sm120a",
         "exe": "",
+        # 老引擎想用固定绝对路径时写这里 (ninfer 引擎用 "ninfer_exe")。
+        "ninfer_exe": "",
         "host": "127.0.0.1",
         "port": 18200,
         "active_id": "",
@@ -855,21 +1050,24 @@ def _migrate_param_keys(params: Dict[str, Any]) -> None:
 
 
 def _drop_removed_params(params: Dict[str, Any]) -> None:
-    """清掉 schema 里已删除的 key (幂等)。
+    """清掉 schema 里已删除的 key (幂等, 见 REMOVED_PARAM_KEYS)。
 
     no-mmap (--no-mmap) 在新版 llama-server 里已经不存在了, 等价设置是
     load-mode = none。只有在旧配置确实打开过 no-mmap 且 load-mode 没被
     用户单独设过时才迁移, 否则直接丢弃。
+    其余 REMOVED_PARAM_KEYS (v0.18.0 ninfer 迁移废弃的老 kvmem flag) 没有
+    等价物, 直接丢弃 —— 留着只会让「⚡KVMem」页出现改了也不生效的死项。
     """
     node = params.pop("no-mmap", None)
-    if not isinstance(node, dict) or not node.get("enabled"):
-        return
-    if str(node.get("value") or "").strip().lower() not in ("true", "1", "yes", "on"):
-        return
-    cur = params.get("load-mode")
-    if isinstance(cur, dict) and cur.get("enabled"):
-        return
-    params["load-mode"] = {"enabled": True, "value": "none"}
+    if (isinstance(node, dict) and node.get("enabled")
+            and str(node.get("value") or "").strip().lower()
+            in ("true", "1", "yes", "on")):
+        cur = params.get("load-mode")
+        if not (isinstance(cur, dict) and cur.get("enabled")):
+            params["load-mode"] = {"enabled": True, "value": "none"}
+    for key in REMOVED_PARAM_KEYS:
+        if key != "no-mmap":
+            params.pop(key, None)
 
 
 def _normalize_model(m: Dict[str, Any]) -> Dict[str, Any]:
@@ -889,7 +1087,7 @@ def _normalize_model(m: Dict[str, Any]) -> Dict[str, Any]:
     base.setdefault("draft_p_split", "0.1")
     base.setdefault("draft_p_min", "0.0")
     # 运行时归属: "" = 主路由 (llama-server) 模型池;
-    # "kvmem" = llama-kvmem-server 分支, 只由「⚡ KVMem」页托管。
+    # "kvmem" = KVMem 分支 (ninfer-kvmem-server), 只由「⚡ KVMem」页托管。
     # "strata" = Strata 分支, 只由「🌐 Strata」页托管。
     base.setdefault("runtime", "")
     # Strata 档位指向自己的引擎配置 json (参数都在那个文件里, 不走 params)
@@ -929,18 +1127,23 @@ def _ensure_model_params(m: Dict[str, Any]) -> None:
         return
     # kvmem 专属参数只给 kvmem 档位补齐 —— 主池模型不需要, 写了也用不上
     kvmem_only = m.get("runtime") == KVMEM_RUNTIME
-    kvmem_common = set(kvmem_common_keys())
+    engine = model_engine(m)
+    kvmem_common = set(kvmem_common_keys(engine)) if kvmem_only else set()
     for p in PARAM_SCHEMA:
         if p["scope"] == "kvmem":
             if not kvmem_only:
                 continue
-            # kvmem 常用项默认勾上, 否则 9 项全要手动勾一遍
+            # 只补本引擎的 kvmem 项 —— 另一套引擎的 flag 补进去也用不上。
+            if p.get("engine", "") not in ("", engine):
+                continue
+            # kvmem 常用项默认勾上, 否则几十项全要手动勾一遍
             enabled, default = p["key"] in kvmem_common, p["default"]
         elif p["scope"] in ("model", "both", "pool"):
             # scope="pool" = 主池 llama-server 专属 (草稿路径/GPU 层数/线程/
-            # 草稿 KV 量化那一组)。kvmem 分支的 --help 里根本没有这些 flag,
-            # 补进去只会让人以为改了能生效 —— 所以 kvmem 档位一律不补。
-            if kvmem_only and p["scope"] == "pool":
+            # 草稿 KV 量化那一组)。ninfer 的 --help 里根本没有这些 flag, 补进去
+            # 只会让人以为改了能生效 —— 所以 ninfer 档位一律不补。
+            # 老 llama-kvmem-server 本身就是 llama.cpp 系, 认得这些 flag, 照补。
+            if p["scope"] == "pool" and not (kvmem_only and engine == KV_ENGINE_LLAMA):
                 continue
             enabled, default = _default_enabled(p["key"]), p["default"]
         else:
@@ -981,8 +1184,6 @@ def list_kinds_choices() -> Dict[str, List[str]]:
         "cache-type-v": ["f32", "f16", "bf16", "q8_0", "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1"],
         "spec-draft-type-k": ["f32", "f16", "bf16", "q8_0", "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1"],
         "spec-draft-type-v": ["f32", "f16", "bf16", "q8_0", "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1"],
-        # kvmem 的 MTP K/V 类型 (单个 flag, K/V 一起设) —— 候选沿用上面的 KV 风格
-        "spec-kv-dtype": ["f16", "f32", "bf16", "q8_0", "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1"],
         "split-mode": ["none", "layer", "row", "tensor"],
         "load-mode": ["auto", "none", "mmap", "mlock", "mmap+mlock", "dio"],
         "lazy-mode": ["on", "off", "auto"],
@@ -1004,8 +1205,19 @@ def list_kinds_choices() -> Dict[str, List[str]]:
             "ngram-mod", "ngram-cache", "none",
         ],
         "spec-draft-ngl": ["auto", "0", "99"],
-        "kvmem-query-policy": ["legacy", "user"],
+        # KVMem 分支 (ninfer) 的枚举 —— 取自 ninfer --help。
+        "kv-dtype": ["bf16", "int8", "fp8", "rk8v4", "rk4v4", "rk4v4-e8",
+                     "rk2v4-e8", "nvfp4", "k8v4"],
+        "spec": ["mtp", "dflash", "dflash2"],
+        "vision-residency": ["resident", "overlay", "cpu"],
+        "kvmem-score-agg": ["mean", "max"],
+        "device-profile": ["auto", "off", "calibrate"],
+        # 老 llama-kvmem-server 引擎的枚举 (取自它的 --help)。
         "kvmem-method": ["recency", "retrieval"],
+        "kvmem-query-policy": ["legacy", "user"],
+        "kvmem-query-replay": ["legacy", "auto"],
+        "kvmem-mtp-state": ["snapshots", "auto", "replay"],
+        "spec-kv-dtype": ["f16", "f32", "q8_0", "q5_0", "q4_0"],
     }
 
 

@@ -147,8 +147,8 @@ def render(cfg: Dict[str, Any], known: Optional[Set[str]] = None,
         excl.update(k for k in config.DRAFT_SHORTCUT_KEYS if not _en(k))
         if not draft_on:
             # 开关关闭: params 里的草稿/推测参数一律不写 (兼容旧配置残留)。
-            # 按 DRAFT_BOX_KEYS 而不是 "spec-draft-" 前缀 —— kvmem 的
-            # --spec-kv-dtype 同样是草稿相关 flag, 前缀筛不到它。
+            # 按 DRAFT_BOX_KEYS 而不是 "spec-draft-" 前缀, 免得漏掉 spec-type
+            # 这种不带头缀的草稿 flag。
             excl.update(k for k in mp
                         if k in config.DRAFT_BOX_KEYS or k.startswith("spec-"))
         # 模型段总是显式写出 (即使与全局段相同),

@@ -15,6 +15,7 @@
 """
 from __future__ import annotations
 
+import json
 import urllib.request
 
 # 只对「本机地址」禁代理 —— 远程监控 (192.168.x.x) 仍要按系统设置走代理,
@@ -30,6 +31,20 @@ def is_local(host: str) -> bool:
 def open_url(url: str, timeout: float = 10.0, headers=None):
     """打开 url。本机地址**绕过系统代理**, 其余按系统设置。"""
     req = urllib.request.Request(url, headers=headers or {})
+    host = req.host or ""
+    if is_local(host):
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        return opener.open(req, timeout=timeout)
+    return urllib.request.urlopen(req, timeout=timeout)
+
+
+def post_json(url: str, payload, timeout: float = 10.0, headers=None):
+    """POST 一段 JSON。本机地址同样**绕过系统代理** (理由见上)。"""
+    h = {"Content-Type": "application/json"}
+    if headers:
+        h.update(headers)
+    body = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=body, headers=h, method="POST")
     host = req.host or ""
     if is_local(host):
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))

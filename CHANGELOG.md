@@ -5,6 +5,15 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
+## [0.3.0] - 2026-10-25
+
+### 新增
+
+- **监控窗口进度条合并为一根**：预填充阶段显示「已读 prompt / 本轮 prompt 总量」，生成阶段显示「已生成 / 本轮可生成上限 (max_tokens)」，都带百分比、速度和预估剩余时间；数据来自 `/status` 的 `prompt_read/prompt_total` 以及 Strata/Poly 的日志行（`reading the prompt: X of Y tokens`、`thinking: X of max Y tokens`）
+- **强制释放显存/内存**：网关新增 `POST /admin/release`（仅本机调用），停掉所有后端并结束任何还在跑的引擎进程（网关、桌面端、手动启动的均可）；监控窗口与服务页均增加「🔓 释放显存/内存」按钮
+- **httpx 新增 `post_json`**：本机地址自动绕过系统代理，用于向网关 POST JSON
+- **PolyStrata 档位迁移 poly.3**：`strata-poly-qwen36-apex.json` 与 `strata-poly-qwen36.json` 的 `exe`/`cwd` 指向 `PolyStrata-0.1.45-poly.3`；`poly-qwen3.6-35b-a3b-ud-q4_k_m` 档位重新加回 router
+
 ## [Unreleased]
 
 ## [0.2.0] - 2026-10-15

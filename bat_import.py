@@ -14,7 +14,7 @@
     也不会丢, 照样能进 preset / kvmem 命令行。
 
 按调用的 exe 分流：
-  llama-kvmem-server.exe -> runtime=kvmem 的档位 (⚡ KVMem)
+  ninfer-kvmem-server.exe / llama-kvmem-server.exe -> runtime=kvmem 的档位 (⚡ KVMem)
   llama-server.exe       -> 主池模型条目
   其它 exe               -> 拒绝, 不猜
 """
@@ -26,7 +26,9 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import config
 
-KVMEM_EXE = "llama-kvmem-server.exe"
+# KVMem 分支两个引擎的进程名 (v0.18.0 起是 ninfer)。
+KVMEM_EXES = ("ninfer-kvmem-server.exe", "llama-kvmem-server.exe")
+KVMEM_EXE = KVMEM_EXES[0]      # 报错文案 / 旧引用
 POOL_EXE = "llama-server.exe"
 
 # 落到模型条目字段, 不进 params
@@ -358,11 +360,12 @@ def _slug(text: str) -> str:
 
 def target_of(exe: str) -> str:
     base = os.path.basename(exe.strip('"')).lower()
-    if base == KVMEM_EXE:
+    if base in KVMEM_EXES:
         return "kvmem"
     if base == POOL_EXE:
         return "pool"
-    raise ValueError(f"暂不支持从 {base or exe} 导入 (只认 {KVMEM_EXE} / {POOL_EXE})")
+    raise ValueError(f"暂不支持从 {base or exe} 导入 "
+                     f"(只认 {' / '.join(KVMEM_EXES)} / {POOL_EXE})")
 
 
 def build_model(sc: Script, p: Parsed, target: str) -> Dict[str, Any]:

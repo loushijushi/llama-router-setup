@@ -8,16 +8,18 @@
 - 🖥️ 图形界面配置多模型路由
 - 🪟 把 `llama-server` 注册为 Windows 服务（开机自启、崩溃重启）
 - 📊 实时监控窗口（实时日志 + token 生成速度，跟直接命令行调用一样）
+- 📈 **监控窗口进度条**：预填充/生成都显示百分比 + 速度 + 预估剩余，一根条，看一眼就懂
 - 🛡️ 显存守护 watchdog（GPU 紧张时自动休眠释放）
+- 🔓 **强制释放显存/内存**：网关 `POST /admin/release`，停掉所有后端并结束任何还在跑的引擎进程（不管是谁加载的）
 - 🌍 新电脑从零环境搭建（环境检查 + 一键修复）
 - 🧭 首次运行向导（空配置自动引导设置）
 
 ## 📥 下载安装
 
-去 [**Releases 页面**](https://github.com/loushijushi/llama-router-setup/releases) 下载最新版本的 zip 包（当前 `v0.1.1`，约 200 KB）：
+去 [**Releases 页面**](https://github.com/loushijushi/llama-router-setup/releases) 下载最新版本的 zip 包（当前 `v0.3.0`，约 200 KB）：
 
 ```
-llama-router-setup-v0.2.0.zip
+llama-router-setup-v0.3.0.zip
 ```
 
 解压到任意目录（**不要**有中文路径），双击 `manager-ui.bat` 即可。
@@ -39,6 +41,8 @@ llama-router-setup-v0.2.0.zip
 | **Windows 服务** | 用 NSSM 把 llama-server 注册成 `llama-router` 服务 |
 | **显存守护** | 可选 watchdog 服务，显存不足时自动 unload 模型 |
 | **实时监控** | 监控窗口拉满整个宽度，日志带颜色高亮、自动跟跳、悬停看模型详情 |
+| **监控窗口进度条** | 预填充阶段显示「已读 prompt / 本轮 prompt 总量」，生成阶段显示「已生成 / 本轮可生成上限 (max_tokens)」，都带百分比、速度和预估剩余，一根条 |
+| **强制释放显存/内存** | 网关 `POST /admin/release`，停掉所有后端并结束任何还在跑的引擎进程（网关、桌面端、手动启动的均可）；监控窗口和服务页均增加「🔓 释放显存/内存」按钮 |
 | **环境检查** | 新电脑上自动检测 Python / tkinter / NSSM / llama.cpp，缺啥装啥 |
 | **一键修复** | Python 用 winget 自动装，llama.cpp 给下载链接 |
 | **零依赖** | 纯 Python 标准库实现，不需要 `pip install` 任何东西 |
@@ -54,7 +58,7 @@ llama-router-setup-v0.2.0.zip
 |---|---|---|---|
 | `pool` 主池 | `llama-server.exe`（router 模式） | `127.0.0.1:8080` | 多模型池，组内切换不用重启 |
 | `kvmem` | `llama-kvmem-server.exe` | `127.0.0.1:8080` | 单模型进程，换档位 = 重启 |
-| `strata` | `C:\Strata` 的 `serve/server.py` | `127.0.0.1:8080` | 单模型进程，参数在 `strata-*.json` 里，加载 ~40GB 要 1-3 分钟 |
+| `strata` | `C:\Strata` 的 `serve/server.py` | `127.0.0.1:8080` | 单模型进程，参数在 `strata-*.json` 里，加载 ~40GB 要 1-3 分钟；PolyStrata 档位（`strata-poly.exe`）已迁 `PolyStrata-0.1.45-poly.3` |
 
 三组**共用同一个内部口**（`gateway.backend_port`，默认 8080）。它们本来就互斥，
 同一时刻只跑一个，共用不会撞 —— 换来的是**谁都不用为了接入网关改自己的端口**，
@@ -380,7 +384,7 @@ py build_release.py --no-config     # 不带 config.example.json
 
 ### 发布新版本到 GitHub Releases
 
-**当前约定**：版本号遵循语义化版本 (SemVer)。已发布 `v0.2.0`（移除 FreeToken 的破坏性版本），后续按 `v0.2.x` 递增。
+**当前约定**：版本号遵循语义化版本 (SemVer)。已发布 `v0.3.0`（新增进度条合并、强制释放显存/内存、PolyStrata 档位迁 poly.3），后续按 `v0.3.x` 递增。
 
 发布流程：
 1. 修改 `VERSION` 文件
@@ -392,7 +396,7 @@ py build_release.py --no-config     # 不带 config.example.json
    ```
 3. 推 tag 触发自动发布：
    ```bash
-    git tag v0.2.0
+    git tag v0.3.0
     git push --tags
    ```
 4. GitHub Actions 自动：

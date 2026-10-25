@@ -127,7 +127,8 @@ def _kill_old_server() -> None:
     请求被随机丢给那个没人管的孤儿 —— 表现是「浏览器时好时坏 / 连不上」。
     这里按 PID + 命令行精确认领, 绝不按镜像名杀 python.exe。
     """
-    for img in ("llama-server.exe", "llama-kvmem-server.exe"):
+    for img in ("llama-server.exe", "ninfer-kvmem-server.exe",
+                "llama-kvmem-server.exe"):
         subprocess.run(["taskkill", "/F", "/IM", img], capture_output=True)
     _kill_old_gateways()
 
@@ -223,7 +224,7 @@ def install(cfg) -> Tuple[bool, str]:
     """注册并启动 llama-router 服务 —— 服务跑的是网关 gateway.py。
 
     网关占住 cfg.host:cfg.port, 把请求按 model 字段转给主池 (llama-server)
-    或 KVMem (llama-kvmem-server) 后端; 两个后端互斥, 切换由网关自己完成。
+    或 KVMem (ninfer-kvmem-server) 后端; 两个后端互斥, 切换由网关自己完成。
     所以这一个服务对两种 serve_mode 都成立, 切换后端不用再重装服务
     (serve_mode 仍保留为「当前活跃组」的标记, 网关切换时会回写它)。
     """

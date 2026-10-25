@@ -69,19 +69,35 @@ def config_path_of(entry: Dict[str, Any]) -> str:
 # ----------------------------------------------------------------------
 # 定位可执行文件
 # ----------------------------------------------------------------------
-def install_dir(cfg: Optional[Dict[str, Any]] = None) -> str:
+def install_dir(cfg: Optional[Dict[str, Any]] = None,
+                entry: Optional[Dict[str, Any]] = None) -> str:
+    """Strata 安装根目录。
+
+    档位条目可以带 `strata_install` 指向另一份分支安装 (例如
+    PolyStrata 的源码树), 没有就回落到 config.strata.install_dir。
+    """
     cfg = cfg if cfg is not None else config.load()
+    own = str((entry or {}).get("strata_install") or "").strip().strip('"')
+    if own:
+        return own
     d = str((cfg.get("strata") or {}).get("install_dir") or "").strip().strip('"')
     return d or DEFAULT_INSTALL_DIR
 
 
-def find_server(cfg: Optional[Dict[str, Any]] = None) -> str:
-    """定位 serve/server.py (Strata 的 HTTP 入口)。"""
+def find_server(cfg: Optional[Dict[str, Any]] = None,
+                entry: Optional[Dict[str, Any]] = None) -> str:
+    """定位 serve/server.py (Strata 的 HTTP 入口)。
+
+    优先用档位自己的 `strata_server`, 其次 config.strata.server, 再按
+    install_dir 找。
+    """
     cfg = cfg if cfg is not None else config.load()
-    explicit = str((cfg.get("strata") or {}).get("server") or "").strip().strip('"')
+    explicit = str((entry or {}).get("strata_server") or "").strip().strip('"')
+    if not explicit:
+        explicit = str((cfg.get("strata") or {}).get("server") or "").strip().strip('"')
     if explicit and os.path.isfile(explicit):
         return explicit
-    root = install_dir(cfg)
+    root = install_dir(cfg, entry)
     direct = os.path.join(root, SERVER_REL)
     if os.path.isfile(direct):
         return direct
@@ -93,17 +109,21 @@ def find_server(cfg: Optional[Dict[str, Any]] = None) -> str:
     return hits[0]
 
 
-def find_python(cfg: Optional[Dict[str, Any]] = None) -> str:
+def find_python(cfg: Optional[Dict[str, Any]] = None,
+                entry: Optional[Dict[str, Any]] = None) -> str:
     """定位跑 server.py 的 python。
 
     Strata 自带 .venv (里面才有 numpy / 引擎依赖), 所以优先用它;
     找不到就用当前解释器 —— 那是「用户在 PowerShell 里直接跑」的情况。
+    档位可以带 `strata_python` 指定别的解释器 (分支安装共用一份 venv 时用)。
     """
     cfg = cfg if cfg is not None else config.load()
-    explicit = str((cfg.get("strata") or {}).get("python") or "").strip().strip('"')
+    explicit = str((entry or {}).get("strata_python") or "").strip().strip('"')
+    if not explicit:
+        explicit = str((cfg.get("strata") or {}).get("python") or "").strip().strip('"')
     if explicit and os.path.isfile(explicit):
         return explicit
-    root = install_dir(cfg)
+    root = install_dir(cfg, entry)
     venv = os.path.join(root, VENV_PYTHON_REL)
     if os.path.isfile(venv):
         return venv
@@ -147,6 +167,31 @@ def ready_timeout_of(cfg: Dict[str, Any]) -> float:
         return 900.0
 
 
+def api_key_of(cfg: Dict[str, Any],
+               entry: Optional[Dict[str, Any]] = None) -> str:
+    """Strata 的 API key —— 网关转请求时要替客户端补上。
+
+    serve/server.py 的 `--api-key` 缺省时读档位 json 的 `api_key`
+    (见 server.py 的 `a.api_key or cfg.get("api_key")`), 而客户端
+    (Hermes 等) 不知道这个 key: 网关不补就是每次生成都 401。
+
+    优先级: config.strata.api_key > 档位 json 的 api_key。
+    """
+    key = str(((cfg or {}).get("strata") or {}).get("api_key") or "").strip()
+    if key:
+        return key
+    entry = entry if entry is not None else active_model(cfg)
+    if not entry:
+        return ""
+    try:
+        val = load_tier(entry).get("api_key")
+    except Exception:                                    # noqa: BLE001
+        return ""
+    if isinstance(val, list):
+        val = val[0] if val else ""
+    return str(val or "").strip()
+
+
 # ----------------------------------------------------------------------
 # 命令行
 # ----------------------------------------------------------------------
@@ -159,7 +204,7 @@ def build_args(cfg: Dict[str, Any], entry: Dict[str, Any]) -> List[str]:
     """
     st = (cfg or {}).get("strata") or {}
     args = [
-        find_server(cfg),
+        find_server(cfg, entry),
         "--engine", "strata",
         "--config", config_path_of(entry),
         "--host", "127.0.0.1",
@@ -507,13 +552,14 @@ def save_tier(entry: Dict[str, Any], managed: Dict[str, Any],
 # 端口
 # ----------------------------------------------------------------------
 def port_busy(port: int, host: str = "") -> bool:
-    """端口是否已被占用 (尝试绑定即知)。"""
+    """端口是否已有进程在监听 (connect 探测; bind 在 Windows 上会漏掉
+    别人绑 0.0.0.0 的情况)。"""
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(0.5)
     try:
-        s.bind((host or "127.0.0.1", int(port)))
-        return False
+        return s.connect_ex((host or "127.0.0.1", int(port))) == 0
     except OSError:
-        return True
+        return False
     finally:
         s.close()
 
@@ -555,9 +601,9 @@ def _check_ready(cfg: Dict[str, Any]) -> Tuple[bool, str, Dict[str, Any]]:
     model = active_model(cfg)
     if not model:
         return False, "没有 Strata 档位：请先在「🌐 Strata」页登记一个 strata-*.json。", {}
-    srv = find_server(cfg)
+    srv = find_server(cfg, model)
     if not srv:
-        root = install_dir(cfg)
+        root = install_dir(cfg, model)
         return False, f"未找到 serve/server.py (已找 {root or '默认目录'})。", model
     cfgp = config_path_of(model)
     if not cfgp or not os.path.isfile(cfgp):
@@ -636,12 +682,12 @@ def run_foreground(cfg: Optional[Dict[str, Any]] = None) -> Tuple[bool, str]:
     port = port_of(cfg)
     if port_busy(port):
         return False, f"端口 {port} 已被占用，无法再启动一个实例。"
-    py = find_python(cfg)
+    py = find_python(cfg, model)
     args = build_args(cfg, model)
     os.makedirs(service.log_dir(), exist_ok=True)
     print(f"[strata] {py} {command_line(cfg, model)}")
     try:
-        proc = subprocess.Popen([py] + args, cwd=install_dir(cfg),
+        proc = subprocess.Popen([py] + args, cwd=install_dir(cfg, model),
                                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     except Exception as e:                             # noqa: BLE001
         return False, f"启动失败: {e}"

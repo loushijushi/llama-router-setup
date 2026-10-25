@@ -7,8 +7,9 @@ config.json 里的模型分三组, 它们跑在**三个不同的运行时**上:
 
   * 主池 (默认组)  -> llama-server.exe, router 模式 (--models-preset),
                       `/v1/models` 只列主池, 组内切换由 router 自己完成;
-  * KVMem 档位     -> llama-kvmem-server.exe, **不支持** --models-preset
-                      (单模型进程), 一次只能跑一个档位, 换档位必须重启;
+  * KVMem 档位     -> ninfer-kvmem-server.exe (v0.18.0; 老 llama-kvmem-server.exe
+                      同名兼容), **不支持** --models-preset (单模型进程),
+                      一次只能跑一个档位, 换档位必须重启;
   * Strata 档位    -> C:\\Strata 的 serve/server.py (自带 OpenAI 兼容层),
                       单模型进程, 参数全在 strata-<档位>.json 里,
                       压根不吃 llama flag; 加载 35-55GB 到内存, 起步 1-3 分钟。
@@ -125,6 +126,46 @@ UPSTREAM_TIMEOUT = 600.0        # 转发时等后端的秒数 (生成可能很�
 STATUS_TIMEOUT = 2.0
 LOG_ROTATE_BYTES = 10 * 1024 * 1024
 SSE_POLL = 0.5                  # 网关自答 /models/sse 时轮询状态的间隔
+
+# stderr 还能不能写。**这个开关决定网关会不会整个变哑**:
+# `log_message()` 是 `send_response()` 的第一步 —— 它一抛, 响应头都发不出去,
+# 于是每个请求都变成「连接被立刻关掉、一个字节都不回」, 而进程还活着、端口
+# 还在听, NSSM 和监控都看不出问题, 只看到日志停在某一秒。
+# (2026-10-20 00:49 之后就是这样: 休眠唤醒回来, stderr 写不动了, 路由器哑了
+# 一整晚, 客户端调用全「失败」。) 所以日志写失败只降级, 绝不往上抛。
+_STDERR_BROKEN = False
+
+
+def stderr_ok() -> bool:
+    return not _STDERR_BROKEN
+
+
+def _emit(line: str, mirror: bool = False) -> None:
+    """写一行日志; stderr 坏了就改投 router.err.log, 永远不抛。
+
+    mirror=True 时无论 stderr 成没成功都再写一份 router.err.log —— UI 的
+    「实时监控」/ 远程 log_relay 只盯 router.*.log, 网关的切换过程要在那儿
+    看得见。
+    """
+    global _STDERR_BROKEN
+    text = line if line.endswith("\n") else line + "\n"
+    wrote = False
+    if not _STDERR_BROKEN:
+        try:
+            sys.stderr.write(text)
+            sys.stderr.flush()
+            wrote = True
+        except Exception:
+            _STDERR_BROKEN = True
+    if wrote and not mirror:
+        return
+    try:
+        import service
+        with open(service.err_log(), "a", encoding="utf-8",
+                  errors="replace") as f:
+            f.write(text)
+    except Exception:
+        pass
 
 
 class BackendError(Exception):
@@ -305,13 +346,20 @@ def http_get(url: str, timeout: float = 5.0) -> Tuple[int, bytes]:
 
 
 def port_busy(port: int, host: str = "127.0.0.1") -> bool:
+    """端口是否有进程在监听。
+
+    **不能**用「试着 bind 一下」判断: Windows 允许在别人绑了
+    0.0.0.0:8123 的情况下再绑 127.0.0.1:8123, bind 成功 -> 误判空闲 ->
+    外部引擎(桌面端自己起的 Strata)完全看不见, 网关会在同一个口上再拉起
+    一个后端, 两个模型同时驻留把内存吃爆 (error 1450)。用 connect 探测。
+    """
     import socket
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(0.5)
     try:
-        s.bind((host, int(port)))
-        return False
+        return s.connect_ex((host, int(port))) == 0
     except OSError:
-        return True
+        return False
     finally:
         s.close()
 
@@ -377,19 +425,20 @@ class Backend:
         strata.exe —— 所以 exe 位放 python, 参数是 server.py 的。
         """
         import strata
-        py = strata.find_python(cfg)
+        target = model or strata.active_model(cfg) or {}
+        py = strata.find_python(cfg, target)
         if not py or not os.path.isfile(py):
             raise BackendError(f"未找到 Strata 的 python: {py or '(空)'}")
-        if not strata.find_server(cfg):
-            root = strata.install_dir(cfg)
+        if not strata.find_server(cfg, target):
+            root = strata.install_dir(cfg, target)
             raise BackendError(f"未找到 serve/server.py (已找 {root or '默认目录'})")
-        target = model or strata.active_model(cfg) or {}
         cfgp = strata.config_path_of(target)
         if not cfgp or not os.path.isfile(cfgp):
             raise BackendError(
                 "没有可用的 Strata 档位: 请先在「🌐 Strata」页登记一个 strata-*.json"
                 + (f" (当前指向 {cfgp}, 文件不存在)" if cfgp else ""))
-        return py, strata.build_args(cfg, target), dict(os.environ), strata.install_dir(cfg)
+        return (py, strata.build_args(cfg, target), dict(os.environ),
+                strata.install_dir(cfg, target))
 
     def _command(self, cfg: Dict[str, Any],
                  model: Optional[Dict[str, Any]]) -> Tuple[str, List[str],
@@ -417,13 +466,16 @@ class Backend:
             return exe, args, dict(os.environ), llama_dir
 
         import kvmem
-        exe = kvmem.find_exe(cfg)
-        if not exe or not os.path.isfile(exe):
-            root = (cfg.get("kvmem") or {}).get("install_dir", "")
-            raise BackendError(f"未找到 llama-kvmem-server.exe (已找 {root or '默认目录'})")
         target = model or kvmem.active_model(cfg) or {}
         if not str(target.get("model") or "").strip():
             raise BackendError("没有 KVMem 档位: 请先在「⚡ KVMem」页添加/选中一个档位")
+        exe = kvmem.find_exe(cfg, target)
+        if not exe or not os.path.isfile(exe):
+            kv = cfg.get("kvmem") or {}
+            roots = " / ".join(x for x in (kv.get("install_dir"),
+                                           kv.get("ninfer_install_dir")) if x)
+            raise BackendError(f"未找到 KVMem 后端 (ninfer-kvmem-server.exe / "
+                               f"llama-kvmem-server.exe, 已找 {roots or '默认目录'})")
         # 后端只绑回环: 复制一份 cfg 改 host/port, 不动真实配置
         c2 = dict(cfg)
         c2["host"] = "127.0.0.1"
@@ -440,9 +492,33 @@ class Backend:
     def running(self) -> bool:
         return self.proc is not None and self.proc.poll() is None
 
+    def reload_port(self, cfg: Dict[str, Any],
+                    model: Optional[Dict[str, Any]] = None) -> None:
+        """按时下的配置重新读一次本组的内部口。
+
+        主池 / KVMem 的口是 `config.gateway.backend_port`, 每次 ensure 都拿
+        新 load 的 cfg 现算, 不用同步。**Strata 不一样**: 它的口写在它自己
+        那份 `strata-*.json` 里 (见 `strata.port_of`), 而 `self.port` 是网关
+        启动时定死的。json 事后被改过就会两头对不上 —— `_command_strata`
+        会按**新**口把进程拉起来, 网关却去**旧**口等 /health, 一直等到
+        ready_timeout(900s) 白等一轮。所以起之前重新同步一次。
+        """
+        if self.kind != STRATA:
+            return
+        try:
+            import strata
+            new_port = int(strata.port_of(cfg, model))
+        except Exception:                                # noqa: BLE001
+            return
+        if new_port != self.port:
+            self._log(f"[{self.name}] 内部口按 strata json 更新: "
+                      f"{self.port} -> {new_port}")
+            self.port = new_port
+
     def start(self, cfg: Dict[str, Any],
               model: Optional[Dict[str, Any]] = None) -> None:
         self.cfg = cfg
+        self.reload_port(cfg, model)
         exe, args, env, cwd = self._command(cfg, model)
         out_p, err_p = self.log_paths()
         os.makedirs(os.path.dirname(out_p), exist_ok=True)
@@ -526,6 +602,17 @@ class Backend:
                     + "\n".join(tail))
             code, body = http_get(url, timeout=5.0)
             if self._health_says_ready(code, body):
+                # 只认**自己拉起来的**进程: 端口被外部引擎占着时, /health
+                # 也会 200, 认了就等于谎报 "已加载", 而自己的子进程还在后面
+                # 读几十 GB 模型 (然后 OOM 死掉)。
+                if self.proc is not None:
+                    owners = set(_port_owner_pids(self.port))
+                    mine = _proc_tree(self.proc.pid)
+                    if owners and not (owners & mine):
+                        raise BackendError(
+                            f"[{self.name}] 端口 {self.port} 上应答的是别的进程 "
+                            f"(pid {sorted(owners)}), 不是本次启动的子进程 "
+                            f"(pid {self.proc.pid}); 疑似外部引擎占着")
                 self._log(f"[{self.name}] 就绪 (127.0.0.1:{self.port})")
                 return
             note = str(code)
@@ -608,6 +695,52 @@ class GatewayState:
                 self._log(f"[网关] 超时, 还有 {len(others)} 个在途请求, 强制切换")
                 return
             self._cv.wait(timeout=min(1.0, max(0.05, deadline - time.time())))
+
+    def _stop_foreign_strata(self, cfg: Dict[str, Any]) -> None:
+        """起后端前收掉不在我们名下的 Strata 引擎。
+
+        「一次只能跑一个模型」原先只覆盖网关自己管的几组; 桌面端/手动起的
+        Strata (绑 0.0.0.0) 既不在 `self.backends` 里, 旧的 bind 式端口探测
+        又看不见它 —— 于是网关在 8124 上再拉一个, 两个模型一起驻留, 把
+        内存/页文件吃爆 (error 1450)。这里按**所有 Strata 档位端口**找属主,
+        命令行确认是 Strata 就收掉; 不是 Strata 的占用者仍交给冲突处理。
+        """
+        try:
+            import strata as sm
+        except Exception:                                # noqa: BLE001
+            return
+        ports = set()
+        for m in cfg.get("models", []) or []:
+            if group_of(m) != STRATA:
+                continue
+            try:
+                ports.add(int(sm.port_of(cfg, m)))
+            except Exception:                            # noqa: BLE001
+                continue
+        if not ports:
+            return
+        me = self.backends[STRATA].proc
+        mine = _proc_tree(me.pid) if (me is not None and me.poll() is None) else set()
+        for port in sorted(ports):
+            for pid in _port_owner_pids(port):
+                if pid in mine:
+                    continue
+                cmd = _proc_cmdline(pid)
+                if not _is_strata_cmd(cmd):
+                    continue
+                self._log(f"[网关] 端口 {port} 上有外部 Strata 引擎 "
+                          f"(pid {pid}), 先停掉它: {cmd[:160]}")
+                try:
+                    subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)],
+                                   capture_output=True, timeout=20)
+                except Exception:                        # noqa: BLE001
+                    pass
+            deadline = time.time() + 15
+            while time.time() < deadline and port_busy(port):
+                time.sleep(0.3)
+            if port_busy(port):
+                self._log(f"[网关] 端口 {port} 仍被占着 (不是 Strata 或收不掉), "
+                          f"交给冲突处理")
 
     def _resolve_conflict(self, cfg: Dict[str, Any], group: str,
                           model_id: Optional[str]) -> str:
@@ -748,8 +881,14 @@ class GatewayState:
                 elif group == STRATA:
                     model_entry = self._strata_entry(cfg, model_id)
                     target = str(model_entry.get("id") or model_id or "")
+                # 冲突判据 / 就绪轮询 / 实际拉的 --port 必须是同一个口
+                # (Strata 的 json 可能在上次网关启动之后被改过, 见 reload_port)
+                b.reload_port(cfg, model_entry)
                 self._log(f"[网关] 切换到 {b.name}"
                           + (f" / {target}" if target else ""))
+                # 「一次只能一个模型」: 桌面端/手动起的 Strata 引擎不在
+                # self.backends 里, 光停自己那几组看不见它 —— 先按端口收掉。
+                self._stop_foreign_strata(cfg)
                 # 内部口被**外部进程**占着(桌面端自己加载的模型 / 上轮残留)
                 # -> 停下来问用户, 不直接抢。强杀会把人家正在进行的对话打断,
                 # 这正是要避免的。
@@ -771,7 +910,7 @@ class GatewayState:
                 # 档位 (见 _merge_strata_status), 而 Strata 又只有 /health 没有
                 # /v1/models, 引擎不报自己是哪一个。原来只回写 serve_mode,
                 # 于是切到别的 Strata 档位后 active_id 还停在上一次的值,
-                # 状态显示整个对不上 —— 明明在跑 IQ3_S, 面板却显示 IQ3_XXS 已加载。
+                # 状态显示整个对不上 —— 明明在跑新档位, 面板却显示旧档位已加载。
                 if group == STRATA and model_entry is not None:
                     self._persist_strata_active_id(
                         str(model_entry.get("id") or ""))
@@ -890,6 +1029,27 @@ class GatewayState:
             self.active_model = None
             self._persist_serve_mode(POOL)
 
+    def release_all(self) -> List[str]:
+        """**强制释放**: 停掉所有后端 (不管哪一组、谁起的), 清掉活跃状态。
+
+        和 unload 的区别: unload 只停「当前活跃的那一组」, 而这里把三组
+        一起停干净 —— 用户点「释放显存/内存」时要的是「显存和内存都还回来」。
+        """
+        stopped: List[str] = []
+        with self._lock:
+            for group, b in self.backends.items():
+                try:
+                    if b.running():
+                        self._log(f"[网关] 强制释放: 停掉 {b.name} 后端")
+                        b.stop()
+                        stopped.append(group)
+                except Exception:                        # noqa: BLE001
+                    pass
+            self.active = None
+            self.active_model = None
+            self.switching = False
+        return stopped
+
     def snapshot(self) -> Dict[str, Any]:
         # **不加锁**: /health 是 UI 状态栏和监控窗口每秒轮询的, 而切换/加载
         # 期间 ensure() 会握着锁不放 (Strata 要 1-3 分钟) —— 上了锁这里就
@@ -976,18 +1136,7 @@ class GatewayApp:
 
     @staticmethod
     def _default_log(msg: str) -> None:
-        line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}"
-        sys.stderr.write(line + "\n")
-        sys.stderr.flush()
-        # 镜像到 router.err.log: UI 的「实时监控」和远程 log_relay 只盯
-        # router.*.log 这两个文件, 网关的切换过程也要在那里看得见。
-        try:
-            import service
-            with open(service.err_log(), "a", encoding="utf-8",
-                      errors="replace") as f:
-                f.write(line + "\n")
-        except Exception:
-            pass
+        _emit(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}", mirror=True)
 
     # ---------- 响应体 ----------
     def health_payload(self) -> Dict[str, Any]:
@@ -1173,12 +1322,55 @@ class GatewayApp:
             headers = {k: v for k, v in handler.headers.items()
                        if k.lower() not in FORWARD_STRIP}
             headers["Host"] = f"127.0.0.1:{b.port}"
+            headers.update(self._backend_auth(group))
             conn.request(handler.command, handler.path,
                          body=body if body else None, headers=headers)
             resp = conn.getresponse()
             handler.send_response_to_backend(resp)
         finally:
             conn.close()
+
+    def _backend_auth(self, group: str) -> Dict[str, str]:
+        """后端要求的鉴权头, 由网关补上 (客户端不需要知道)。
+
+        Strata 的档位 json 里写了 `api_key` 时, serve/server.py 会要求
+        /v1/* 带 Bearer —— 客户端 (Hermes 等) 只认网关, 不会带这个 key。
+        """
+        if group != STRATA:
+            return {}
+        try:
+            import strata
+            key = strata.api_key_of(self.cfg_loader())
+        except Exception:                                # noqa: BLE001
+            return {}
+        return {"Authorization": f"Bearer {key}"} if key else {}
+
+    def force_release(self) -> Dict[str, Any]:
+        """**强制释放显存/内存**: 停掉网关管的后端, 再把任何还在跑的引擎
+        进程全部结束掉 —— 不管它是谁加载的 (网关、桌面端、手动起的)。
+
+        为什么网关来做而不是 UI: 引擎多半跑在 NSSM 服务下 (SYSTEM 权限),
+        桌面端 (普通用户) 杀不掉它们。
+        """
+        stopped = self.state.release_all()
+        killed: List[Dict[str, Any]] = []
+        me = os.getpid()
+        mine = _proc_tree(me)            # 自己 + 自己的子进程 (网关管的后端)
+        for pid, cmd in _all_proc_cmdlines():
+            if pid in mine:
+                continue
+            if not _is_engine_cmd(cmd):
+                continue
+            try:
+                subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)],
+                               capture_output=True, timeout=20)
+                killed.append({"pid": pid, "cmd": cmd[:200]})
+                self.log(f"[网关] 强制释放: 结束引擎进程 pid {pid}: {cmd[:140]}")
+            except Exception:                            # noqa: BLE001
+                pass
+        self.log(f"[网关] 强制释放完成: 停掉后端 {stopped or '无'}, "
+                 f"结束引擎进程 {len(killed)} 个")
+        return {"status": "ok", "stopped": stopped, "killed": killed}
 
 
 # ----------------------------------------------------------------------
@@ -1195,10 +1387,9 @@ class GatewayHandler(BaseHTTPRequestHandler):
         return self.server.app          # type: ignore[attr-defined]
 
     def log_message(self, fmt: str, *args: Any) -> None:      # 不做反向 DNS
-        sys.stderr.write('%s - - [%s] %s\n'
-                         % (self.client_address[0], self.log_date_time_string(),
-                            fmt % args))
-        sys.stderr.flush()
+        _emit('%s - - [%s] %s' % (self.client_address[0],
+                                  self.log_date_time_string(),
+                                  fmt % args))
 
     # ---- 入口 ----
     def do_GET(self) -> None:
@@ -1237,6 +1428,15 @@ class GatewayHandler(BaseHTTPRequestHandler):
                         "error": {"message": f"model not found: {path}",
                                   "type": "invalid_request_error"}})
                 return self._send_json(200, node)
+            # 强制释放显存/内存 (桌面端的「🔓 释放显存/内存」按钮打这里)。
+            # **只允许本机调用**: 它会结束进程, 绝不能暴露给局域网。
+            if path in ("/admin/release", "/models/release") and self.command == "POST":
+                host = str(self.client_address[0] if self.client_address else "")
+                if host not in ("127.0.0.1", "::1", "localhost"):
+                    return self._send_json(403, {
+                        "error": {"message": "只允许本机调用 /admin/release",
+                                  "type": "invalid_request_error"}})
+                return self._send_json(200, self.app.force_release())
             # 老接口 /models: KVMem 单模型进程没有它 (404), 网关按同一份
             # 目录答 —— 两组模型都列得出来。
             if path == "/models" and self.command == "GET":
@@ -1296,10 +1496,9 @@ class GatewayHandler(BaseHTTPRequestHandler):
             self.close_connection = True
         except Exception as e:                              # noqa: BLE001
             # 500 一定要留下痕迹, 否则线上只看到一条孤零零的访问日志
-            sys.stderr.write("%s - - [%s] %s %s -> 500 %s\n"
-                             % (self.client_address[0], self.log_date_time_string(),
-                                self.command, self.path, traceback.format_exc()))
-            sys.stderr.flush()
+            _emit("%s - - [%s] %s %s -> 500 %s"
+                  % (self.client_address[0], self.log_date_time_string(),
+                     self.command, self.path, traceback.format_exc()))
             try:
                 self._send_json(500, {"error": {"message": f"{type(e).__name__}: {e}",
                                                 "type": "server_error"}})
@@ -1424,6 +1623,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
                        if k.lower() not in FORWARD_STRIP}
             headers["Host"] = f"127.0.0.1:{b.port}"
             headers["Accept-Encoding"] = "identity"   # 网关要改体, 别用压缩
+            headers.update(self.app._backend_auth(group))
             conn.request(self.command, self.path,
                          body=body if body else None, headers=headers)
             resp = conn.getresponse()
@@ -1850,6 +2050,104 @@ def _port_owner_pids(port: int) -> List[int]:
     return pids
 
 
+def _proc_tree(pid: int) -> set:
+    """pid 及它的全部子孙 (一次取进程表再按父子关系摊平)。"""
+    ps = ("Get-CimInstance Win32_Process | "
+          "Select-Object ProcessId,ParentProcessId | "
+          "ForEach-Object { \"$($_.ProcessId) $($_.ParentProcessId)\" }")
+    try:
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+            capture_output=True, timeout=25)
+        txt = (out.stdout or b"").decode("utf-8", "replace")
+    except Exception:                                    # noqa: BLE001
+        return {int(pid)}
+    kids: Dict[int, set] = {}
+    for line in txt.splitlines():
+        parts = line.split()
+        if len(parts) != 2:
+            continue
+        try:
+            c, p = int(parts[0]), int(parts[1])
+        except ValueError:
+            continue
+        kids.setdefault(p, set()).add(c)
+    seen = {int(pid)}
+    stack = [int(pid)]
+    while stack:
+        for c in kids.get(stack.pop(), ()):
+            if c not in seen:
+                seen.add(c)
+                stack.append(c)
+    return seen
+
+
+def _is_strata_cmd(cmd: str) -> bool:
+    """命令行是不是一个 Strata 引擎/控制进程 (含桌面端自己起的)。"""
+    c = (cmd or "").lower().replace("/", "\\")
+    if not c:
+        return False
+    if "strata.exe" in c and "--serve" in c:
+        return True
+    if "strata.py" in c and " serve" in c:
+        return True
+    if "serve\\server.py" in c and "strata" in c:
+        return True
+    return False
+
+
+# 「强制释放」要收的引擎进程 (不管是谁加载的: 网关起的、桌面端起的、手动起的)。
+# 只按**可执行文件/脚本名**判断, 绝不按 python.exe 这种通用名去杀。
+_ENGINE_EXE_MARKS = (
+    "strata.exe",               # Strata 引擎 (--serve)
+    "strata-poly.exe",          # PolyStrata 引擎 (--serve)
+    "llama-server.exe",         # 主池
+    "llama-kvmem-server.exe",   # KVMem
+    "ninfer-kvmem-server.exe",  # KVMem (新引擎)
+)
+
+
+def _is_engine_cmd(cmd: str) -> bool:
+    """这个命令行是不是一个「模型引擎」进程 (该被强制释放收掉的那种)。"""
+    c = (cmd or "").lower().replace("/", "\\")
+    if not c:
+        return False
+    if "gateway.py" in c:                 # 网关自己
+        return False
+    if "serve\\server.py" in c:           # Strata / PolyStrata 的控制进程
+        return "strata" in c
+    for exe in _ENGINE_EXE_MARKS:
+        if exe in c:
+            if exe == "strata.exe" and "strata-poly.exe" in c:
+                continue                   # 别被 poly 的名字带偏
+            return True
+    return False
+
+
+def _all_proc_cmdlines() -> List[Tuple[int, str]]:
+    """一次拿到所有进程的 (pid, 命令行)。"""
+    ps = ("Get-CimInstance Win32_Process | ForEach-Object { "
+          "\"$($_.ProcessId)|$($_.CommandLine)\" }")
+    try:
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+            capture_output=True, timeout=45)
+    except Exception:                                    # noqa: BLE001
+        return []
+    res: List[Tuple[int, str]] = []
+    for line in (out.stdout or b"").decode("utf-8", "replace").splitlines():
+        line = line.strip()
+        if not line or "|" not in line:
+            continue
+        pid_s, _, cmd = line.partition("|")
+        try:
+            pid = int(pid_s.strip())
+        except ValueError:
+            continue
+        res.append((pid, cmd.strip()))
+    return res
+
+
 def _proc_cmdline(pid: int) -> str:
     """这个 PID 的命令行 (用来判断是不是我们认识的后端)。
 
@@ -1874,6 +2172,7 @@ def _proc_cmdline(pid: int) -> str:
 # 只有「通用名 / 我们自己起的名字」写死; 各软件的**真实可执行路径一律现取**
 # (见 backend_marks), 这样升级换目录、或新增一个模型/软件都能自动跟上。
 _STATIC_MARKS = ("llama-server.exe", "llama-kvmem-server.exe",
+                 "ninfer-kvmem-server.exe",
                  r"serve\server.py", "serve/server.py")
 
 # 进程特征缓存 (动态那部分)。设一次 cwd 变了不用反复问磁盘。
@@ -2154,6 +2453,57 @@ def _start_model_guard(app: GatewayApp) -> Optional[Any]:
         return None
 
 
+WATCHDOG_EVERY = 20.0           # 自检间隔 (秒)
+WATCHDOG_TIMEOUT = 5.0          # 自检请求超时
+WATCHDOG_STRIKES = 3            # 连续失败几次才退出
+
+
+def _start_watchdog(app: Any, host: str, port: int) -> None:
+    """自检: 连自己的 /health 都拿不到, 就退出让 NSSM 拉起来。
+
+    要防的是「进程活着、端口还在听, 但请求一律回不来」—— 日志停住, NSSM
+    觉得一切正常, 监控也显示健康, 只有客户端全部失败。这种状态代码里救不
+    回来 (句柄坏了 / handler 线程被占死 / 休眠唤醒后 socket 不再被派发),
+    退出重启是唯一可靠的自愈方式。2026-10-10 卡了 12 小时、2026-10-20
+    哑了一整晚, 都是这个形态。
+
+    /health 在 `_handle` 最前面就答, 不碰 GatewayState 的切换锁, 所以正常
+    加载 / 生成大模型时不会被误判。连着失败 3 次 (≈60 秒完全没响应) 才动手。
+    """
+    target = "127.0.0.1" if host in ("0.0.0.0", "::", "") else host
+
+    def loop() -> None:
+        bad = 0
+        time.sleep(WATCHDOG_TIMEOUT * 2)        # 启动/重启的宽限
+        while True:
+            ok = False
+            try:
+                conn = http.client.HTTPConnection(target, int(port),
+                                                  timeout=WATCHDOG_TIMEOUT)
+                try:
+                    conn.request("GET", "/health")
+                    resp = conn.getresponse()
+                    ok = int(resp.status) == 200
+                    resp.read()
+                finally:
+                    conn.close()
+            except Exception:
+                ok = False
+            if ok:
+                bad = 0
+            else:
+                bad += 1
+                if bad >= WATCHDOG_STRIKES:
+                    app.log(f"[网关] 自检连续 {bad} 次失败 "
+                            f"(端口在听但请求回不来), 退出让服务重启")
+                    os._exit(1)
+            time.sleep(WATCHDOG_EVERY)
+
+    th = threading.Thread(target=loop, daemon=True, name="gateway-watchdog")
+    th.start()
+    app.log("[网关] 自检看门狗已启动")
+
+
 def main() -> int:
     cfg = config.load()
     app = GatewayApp()
@@ -2204,6 +2554,7 @@ def main() -> int:
         return 2
     server.app = app
     app.log(f"[网关] 对外监听 http://{host}:{port}")
+    _start_watchdog(app, host, port)
 
     def _shutdown(*_a: Any) -> None:
         try:

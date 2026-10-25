@@ -4,7 +4,7 @@
   1. 服务      安装/卸载/启停/状态/前台运行 + 操作日志
   2. 全局      llama_dir/host/port/... + 全局参数开关表
   3. 模型      增删改查模型条目 + 草稿模型 (MTP/DFlash) + 参数子表
-  4. ⚡KVMem   llama-kvmem-server 分支的档位/服务/专属参数
+  4. ⚡KVMem   KVMem 分支 (ninfer-kvmem-server) 的档位/服务/专属参数
   5. 偏好      自定义哪些是常用参数 + 自定义额外参数
   6. 环境      环境自检
 
@@ -348,27 +348,34 @@ class ParamRow:
 # 参数面板（带 Canvas 滚动）
 # =========================================================================
 # ParamPanel 的作用域 -> 允许出现的参数 scope 集合
-#   model      模型页 (主池)             = model + both
-#   kvmem      旧写法, 与 kvmem_full 等价  = kvmem + both
-#   kvmem_full 「⚡ KVMem」页 = 模型页全部 + kvmem 专属项
+#   model      模型页 (主池 llama-server)   = model + both
+#   kvmem      KVMem 页 (ninfer)            = 只显示 kvmem 专属项
+#   kvmem_full 与 kvmem 等价 (保留旧名兼容)
+# KVMem 分支 (ninfer) 与主池 llama-server 是**两套互不通用的 flag**: 它只认
+# config.PARAM_SCHEMA 里 scope="kvmem" 的那一组 (config.KVMEM_SCOPED_KEYS),
+# 所以「⚡KVMem」页不再混入主池的 model / both 参数。
 # scope="pool" (主池 llama-server 专属, 见 config.POOL_SCOPED_KEYS) 不在这里列出:
 # 那一组 (草稿模型路径 / GPU 层数 / 设备 / 线程 / n-min / p-split / 草稿 KV 量化 /
-# 后端采样) 全部属于草稿面板 DRAFT_BOX_KEYS, 由 draft_box 直接渲染, 参数子表两页
-# 都不显示它们; 面板要显示什么, 以 DRAFT_BOX_KEYS + KVMEM_SPEC_KEYS 为准。
+# 后端采样) 全部属于草稿面板 DRAFT_BOX_KEYS, 由 draft_box 直接渲染, 参数子表
+# 不显示它们。
 _SCOPE_SET = {
     "model": frozenset({"model", "both"}),
-    "kvmem": frozenset({"kvmem", "both"}),
-    "kvmem_full": frozenset({"kvmem", "both", "model"}),
+    "kvmem": frozenset({"kvmem"}),
+    "kvmem_full": frozenset({"kvmem"}),
 }
 
 
 class ParamPanel(ttk.Frame):
-    def __init__(self, master, *, scope: str, get, set_, refresh_outer) -> None:
+    def __init__(self, master, *, scope: str, get, set_, refresh_outer,
+                 engine_getter=None) -> None:
         super().__init__(master, padding=0)
         self.scope = scope
         self._get = get
         self._set = set_
         self._refresh_outer = refresh_outer
+        # 仅「⚡KVMem」页用: 返回当前档位的引擎 ("ninfer" / "llama")。
+        # 两个引擎 flag 方言不同, 面板据此只显示当前引擎的那一批参数。
+        self._engine_getter = engine_getter
         self._common_rows: Dict[str, ParamRow] = {}
         self._advanced_rows: Dict[str, ParamRow] = {}
         self._advanced_visible = False
@@ -445,27 +452,36 @@ class ParamPanel(ttk.Frame):
         self._common_rows.clear()
         self._advanced_rows.clear()
 
-        # 「⚡ KVMem」页有自己的常用列表, 不跟主模型页的 common_keys 混用;
-        # kvmem_full = 模型页全部参数 + kvmem 专属项 (两个页面只差指向的程序)
-        allowed = _SCOPE_SET.get(self.scope) or frozenset({self.scope, "both"})
-        if self.scope == "kvmem":
-            order_src = config.kvmem_common_keys()
-        elif self.scope == "kvmem_full":
-            kv = set(config.kvmem_common_keys())
-            order_src = (list(config.kvmem_common_keys())
-                         + [k for k in config.common_keys() if k not in kv])
+        # 「⚡ KVMem」页有自己的常用列表, 不跟主模型页的 common_keys 混用。
+        # 两个引擎并存: 面板按当前档位的引擎切换 scope 集合与常用清单 ——
+        # ninfer 只认自己那套 kvmem flag; 老 llama 引擎是 llama.cpp 系, 还能
+        # 显示 scope in (both, model) 的通用项 (ctx-size / cache-type-* / ...)。
+        engine = ""
+        if self.scope in ("kvmem", "kvmem_full") and self._engine_getter:
+            engine = self._engine_getter() or config.KV_ENGINE_NINFER
+        if engine:
+            allowed = config.kvmem_panel_scopes(engine)
+            order_src = config.kvmem_common_keys(engine)
         else:
+            allowed = _SCOPE_SET.get(self.scope) or frozenset({self.scope, "both"})
             order_src = config.common_keys()
         common_set = set(order_src)
         applicable = []
         for p in config.PARAM_SCHEMA:
             if p["scope"] not in allowed:
                 continue
+            # 另一套引擎专属的 kvmem flag 不在本面板出现
+            if (p.get("scope") == "kvmem" and engine
+                    and p.get("engine", "") not in ("", engine)):
+                continue
             # 模型面板都排除两个独立区块专属的 key:
-            # 同一条记录的同一个 key 全项目只出现一次, 否则两边会互相覆盖
-            if self.scope in ("model", "kvmem", "kvmem_full") and (
-                    p["key"] in config.DRAFT_BOX_KEYS
-                    or p["key"] in config.MMKV_BOX_KEYS):
+            # 同一条记录的同一个 key 全项目只出现一次, 否则两边会互相覆盖。
+            # 老 llama 引擎 (llama.cpp 系) 例外: 它本来就要调 KV 量化 /
+            # mmproj 卸载这些, 让它们在 KVMem 面板里也能编辑 (草稿面板那组仍排除)。
+            blocked = config.DRAFT_BOX_KEYS
+            if engine != config.KV_ENGINE_LLAMA:
+                blocked = blocked | config.MMKV_BOX_KEYS
+            if self.scope in ("model", "kvmem", "kvmem_full") and p["key"] in blocked:
                 continue
             applicable.append(p)
         for p in config.extra_params():
@@ -1156,6 +1172,12 @@ class MonitorWindow(tk.Toplevel):
         # 一直是那段死日志, 用户的感受就是「日志完全没有更新」。
         self._file_lines: Dict[str, deque] = {}
         self._file_seen: Dict[str, float] = {}
+        # 日志 tail 出来的「生成 / prefill」快照, 进度条的数据源。
+        # **必须在这里建好**: _note_line 在 tail 线程里被调用, 直接对
+        # self._last_speed 赋值; 没初始化就是 KeyError, 又被 except Exception
+        # 吞掉 -> 进度条永远停在「空闲」, 而日志里明明在刷 n_gen。
+        # 键: __latest__ 生成速度 / __prefill__ 填充进度 / __task__ 本轮总长
+        self._last_speed: Dict[str, Dict[str, Any]] = {}
         # 解析后的最后生成速度 (model_id -> {tg, tg_3s, ts})
         self._last_speed: Dict[str, Dict[str, Any]] = {}
         # 日志是否自动跟跳 (True=跟到最新, False=用户在看历史, 不自动滚)
@@ -1251,16 +1273,22 @@ class MonitorWindow(tk.Toplevel):
                                     font=("Segoe UI", 9), foreground="#0066CC")
         self.health_lbl.pack(side=tk.LEFT, padx=(0, 16))
 
-        # 进度条: 实时显示 prefill / 生成 (读网关 /status)。
-        # 翻日志看进度太费劲, 这里给一条直观的: 阶段 + 第几个 token + tok/s。
+        # 进度条: **一根**。按当前阶段显示百分比:
+        #   预填充 -> 已读 prompt / 本轮 prompt 总量
+        #   生成   -> 已生成 / 本轮可生成上限 (max_tokens)
+        # 以前是两条 (填充/生成), 但两边的「总量」其实都拿得到, 分成两条只会
+        # 让人猜「现在在走哪根」, 而且两条都只显示速度就更容易看错。
         prog_row = ttk.Frame(self, padding=(10, 2))
         prog_row.pack(fill=tk.X, padx=8, pady=(0, 4))
-        self.prog_bar = ttk.Progressbar(prog_row, length=200, mode="determinate",
+
+        ttk.Label(prog_row, text="进度", font=("Segoe UI", 9),
+                  foreground="#666666").pack(side=tk.LEFT, padx=(0, 4))
+        self.prog_bar = ttk.Progressbar(prog_row, length=280, mode="determinate",
                                         maximum=100)
-        self.prog_bar.pack(side=tk.LEFT, padx=(0, 8))
-        self.prog_var = tk.StringVar(value="进度: 空闲")
+        self.prog_bar.pack(side=tk.LEFT, padx=(0, 6))
+        self.prog_var = tk.StringVar(value="空闲")
         self.prog_lbl = ttk.Label(prog_row, textvariable=self.prog_var,
-                                  font=("Segoe UI", 9), foreground="#333333")
+                                  font=("Segoe UI", 9), foreground="#cc6600")
         self.prog_lbl.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
         # 模型条**单独占一整行**: 主池 + KVMem 的模型都在这里, 一行放不下就
@@ -1275,6 +1303,17 @@ class MonitorWindow(tk.Toplevel):
         self.models_strip_frame.pack(side=tk.LEFT, fill=tk.X, expand=True)
         self.models_strip_frame.bind("<Configure>",
                                      lambda _e: self._layout_models(), add="+")
+        # 直接切换后端加载的模型: 网关单模型组 (/models/load) 会先卸载旧的再拉起新的
+        self._switch_var = tk.StringVar(value="")
+        ttk.Label(models_row, textvariable=self._switch_var,
+                  font=("Segoe UI", 9), foreground="#0066cc").pack(
+            side=tk.RIGHT, padx=(6, 0))
+        self._release_btn = ttk.Button(models_row, text="🔓 释放显存/内存",
+                                       width=15, command=self._release_resources)
+        self._release_btn.pack(side=tk.RIGHT, padx=(8, 0))
+        self._switch_btn = ttk.Button(models_row, text="⇄ 切换模型", width=11,
+                                      command=self._choose_and_switch)
+        self._switch_btn.pack(side=tk.RIGHT, padx=(8, 0))
 
         # 主区域: 日志拉满 (无横向分割)
         log_box = ttk.Frame(self)
@@ -1840,6 +1879,21 @@ class MonitorWindow(tk.Toplevel):
     _PREFILL_RE = re.compile(
         r"prompt processing,\s*n_tokens\s*=\s*(\d+),\s*progress\s*=\s*([\d.]+)"
         r".*?t\s*=\s*([\d.]+)\s*s(?:\s*/\s*([\d.]+)\s*tokens per second)?")
+    # 生成阶段从「任务行」拿总长: "processing task, n_prompt = 231785, n_predict = 12288"
+    # 只有它能算出生成的百分比和 ETA —— n_gen 行本身不带总量。
+    _TASK_RE = re.compile(
+        r"processing task,\s*n_prompt\s*=\s*(\d+),\s*n_predict\s*=\s*(\d+)")
+    # Strata / PolyStrata 的进度行 (它们的 /status 不给 prompt_read):
+    #   填充: "[strata] reading the prompt: 2,500 of 20,501 tokens, 1 s so far"
+    #   生成: "[strata] thinking: 223 of max 256 tokens, 92.3 tok/s, 10 s"
+    # 「of Y」可以没有 (引擎拿不到总量时只报已读), 那时总量用 /status 的
+    # prompt_tokens 补 —— 它就是这一轮要喂进去的 prompt 长度。
+    _PREFILL45_RE = re.compile(
+        r"reading the prompt:\s*([\d,]+)(?:\s+of\s+([\d,]+))?\s+tokens"
+        r"(?:,\s*([\d.]+)\s*s so far)?")
+    _GEN45_RE = re.compile(
+        r"\[strata\]\s+(thinking|answering|writing a tool call[^:]*):\s*([\d,]+)"
+        r"\s+of\s+(.*?)\s+tokens,\s*([\d.]+)\s+tok/s")
 
     def _note_line(self, line: str) -> None:
         """记录一行日志时顺手解析生成速度 (本地读文件和远程拉转发共用)。"""
@@ -1864,6 +1918,52 @@ class MonitorWindow(tk.Toplevel):
                 "rate": float(p.group(4)) if p.group(4) else None,
                 "ts": _time.time(),
             }
+        t = self._TASK_RE.search(line)
+        if t:
+            # 任务行给出本轮要生成多少 (n_predict), 生成进度条据此算百分比与 ETA。
+            self._last_speed["__task__"] = {
+                "prompt": int(t.group(1)),
+                "max_gen": int(t.group(2)),
+                "ts": _time.time(),
+            }
+        p45 = self._PREFILL45_RE.search(line)
+        if p45:
+            # Strata/Poly 的填充进度: 已读 / 本轮 prompt 总量。
+            # 见到这行 = 正在读 prompt, 一定还没进生成阶段, 顺手把上一轮的
+            # 生成速度清掉 (否则进度条会拿旧的 n_gen 显示成「生成中」)。
+            done = int(p45.group(1).replace(",", "") or 0)
+            total = int((p45.group(2) or "0").replace(",", "") or 0)
+            elapsed = float(p45.group(3) or 0.0)
+            self._last_speed.pop("__latest__", None)
+            self._last_speed["__prefill__"] = {
+                "processed": done,
+                "total": total,
+                "progress": (done / float(total)) if total else 0.0,
+                "elapsed_s": elapsed,
+                "rate": (done / elapsed) if elapsed > 0 else None,
+                "ts": _time.time(),
+            }
+        g45 = self._GEN45_RE.search(line)
+        if g45:
+            # 生成进度行: 已生成 / 本轮上限 (max_tokens)。上限写在
+            # "max 256" 或 "budget 128 (max 256)" 里, 取最后一个数字。
+            done = int(g45.group(2).replace(",", "") or 0)
+            nums = re.findall(r"[\d,]+", g45.group(3) or "")
+            limit = 0
+            if nums:
+                try:
+                    limit = int(nums[-1].replace(",", "") or 0)
+                except ValueError:
+                    limit = 0
+            rate = float(g45.group(4) or 0.0)
+            self._last_speed.pop("__prefill__", None)
+            self._last_speed["__latest__"] = {
+                "n_gen": done, "tg": rate, "tg_3s": rate, "ts": _time.time(),
+            }
+            if limit:
+                self._last_speed["__task__"] = {
+                    "prompt": 0, "max_gen": limit, "ts": _time.time(),
+                }
 
     def _tail_loop(self) -> None:
         """后台线程: 持续读日志新内容 -> buffer。
@@ -2012,9 +2112,11 @@ class MonitorWindow(tk.Toplevel):
                 except Exception:
                     models_data = {"data": []}
                 # /status: 实时进度 (阶段/prefill/生成/tok_s)。网关对没有这个
-                # 端点的后端会合成空壳, 所以这里永远拿得到字段。
+                # 端点的后端会合成空壳, 所以这里永远拿得到字段。超时给 2.5s:
+                # 网关转发 Strata 的 /status 自己就留了 2s (STATUS_TIMEOUT),
+                # 1s 会把「网关正在等上游」错判成「拿不到进度」。
                 try:
-                    with httpx.open_url(f"{base}/status", timeout=1.0) as r:
+                    with httpx.open_url(f"{base}/status", timeout=2.5) as r:
                         status_data = json.loads(r.read().decode("utf-8"))
                 except Exception:
                     status_data = {}
@@ -2336,19 +2438,38 @@ class MonitorWindow(tk.Toplevel):
             pass
         self.log_text.configure(state=tk.DISABLED)
 
-    def _render_progress(self, st: dict) -> None:
-        """进度条: 读网关 /status, 直观显示 prefill / 生成。
+    @staticmethod
+    def _eta(remaining: float, rate: float) -> str:
+        """剩余时间 -> 人类可读的一小段。速率不可信时不给估计, 宁可空着。"""
+        if rate <= 0 or remaining <= 0:
+            return ""
+        sec = remaining / rate
+        if sec < 1:
+            return "  剩余 <1s"
+        if sec < 60:
+            return "  剩余 %.0fs" % sec
+        if sec < 3600:
+            return "  剩余 %dm%02ds" % (int(sec // 60), int(sec % 60))
+        return "  剩余 %dh%02dm" % (int(sec // 3600), int((sec % 3600) // 60))
 
-        Strata 的 /status 有 state/phase/prompt_tokens/generated/max_tokens/
-        tok_s/elapsed_s; KVMem/主池是合成空壳 (state=idle, 其余 None)。
-        - 生成中: 进度条 = generated/max_tokens, 文案带 tok/s
-        - 读 prompt 中 (还没出第一个 token): 进度条走不定长, 文案带已读 token 数
-        - 空闲/未加载: 进度条归零
+    def _render_progress(self, st: dict) -> None:
+        """**一根**进度条, 按当前阶段显示百分比 + 速度 + 预估剩余。
+
+        - 预填充阶段: 已读 prompt / 本轮 prompt 总量 (总长就是这轮要喂进去的
+          prompt 的 token 数, 读完即 100%)
+        - 生成阶段:   已生成 / 本轮可生成上限 (max_tokens, 引擎给的上限)
+
+        数据来源:
+        - Strata 0.1.47 的 /status 直接给 prompt_read / prompt_total /
+          generated / max_tokens —— 全部现成。
+        - Strata / PolyStrata 0.1.45 的 /status 只有 prompt_tokens (本轮 prompt
+          长度) 和 generated / max_tokens; 填充进度从它自己的日志行补:
+          "[strata] reading the prompt: 22,272 of 53,612 tokens, 8 s so far"。
+        - KVMem / 主池是 llama-server, 没有 /status, 从日志的
+          "prompt processing, n_tokens = …, progress = …" 和
+          "processing task, n_predict = …" 解析 (和以前一样)。
         """
         s = st.get("status") or {}
-        # Strata 的 /status 顶层字段是 busy/phase/generated/max_tokens/
-        # prompt_tokens, **没有 state/tok_s/elapsed_s** (实测)。KVMem/主池走网关
-        # 合成空壳, 有 state 没有 busy。所以两种都要认。
         state = str(s.get("state") or "")
         busy = bool(s.get("busy"))
         generating = busy or state == "generating"
@@ -2356,109 +2477,148 @@ class MonitorWindow(tk.Toplevel):
         gen = s.get("generated")
         mx = s.get("max_tokens")
         ptok = s.get("prompt_tokens")
-        tok_s = s.get("tok_s")
-        el = s.get("elapsed_s")
-        # tok_s 不在 /status 里 -> 退回日志 tail 解析出的实时速度
-        if tok_s is None:
-            latest = getattr(self, "_last_speed", {}).get("__latest__", {})
-            tok_s = latest.get("tg")
-        prefill = generating and (gen in (None, 0))
-        # KVMem/主池没有 /status (网关合成空壳, state 恒 idle), 进度条对它们
-        # 一直是空的。改从日志 tail 解析: prefill 行带 progress/elapsed,
-        # n_gen 行带生成数和 tok/s。日志新鲜度 5 秒内才算, 过期一律回空闲,
-        # 否则面板会一直挂着一个早就结束的数字。
-        if not generating and not prefill:
-            sp = getattr(self, "_last_speed", {}) or {}
-            pre = sp.get("__prefill__")
-            latest = sp.get("__latest__")
-            nowt = time.time()
-            if pre and (nowt - pre.get("ts", 0)) < 5.0:
-                generating = True
-                prefill = True
-                ptok = pre.get("processed")
-                el = pre.get("elapsed_s")
-                tok_s = pre.get("rate")
+        sp = getattr(self, "_last_speed", {}) or {}
+        now = time.time()
+        reading = (state == "reading"
+                   or phase in ("reading the prompt", "prefill", "reading"))
+
+        # ---- 预填充 ----
+        pre = sp.get("__prefill__")
+        pre_ok = bool(pre and (now - pre.get("ts", 0)) < 5.0)
+        sread, stotal = s.get("prompt_read"), s.get("prompt_total")
+        p_total = p_done = 0
+        p_rate = 0.0
+        if pre_ok and pre:
+            p_done = int(pre.get("processed") or 0)
+            p_total = int(pre.get("total") or 0)
+            if not p_total:
+                prog0 = float(pre.get("progress") or 0.0)
+                p_total = int(round(p_done / prog0)) if prog0 > 0 else 0
+            p_rate = float(pre.get("rate") or 0.0)
+        elif sread is not None and stotal:
+            p_done = int(sread or 0)
+            p_total = int(stotal or 0)
+            p_rate = float(s.get("prefill_tok_s_mean") or 0.0)
+        if not p_total and p_done and ptok:
+            # 引擎只报「已读多少」时, 总量用这一轮的 prompt 长度 (就是
+            # prompt_tokens) —— 读完即 100%。
+            p_total = int(ptok)
+
+        # ---- 生成 ----
+        latest = sp.get("__latest__")
+        task = sp.get("__task__")
+        g_fresh = bool(latest and (now - latest.get("ts", 0)) < 5.0)
+        g_done = g_total = 0
+        g_rate = 0.0
+        g_known = False
+        if g_fresh:
+            g_done = int(latest.get("n_gen") or 0)
+            g_rate = float(latest.get("tg") or 0.0)
+            if task and (now - task.get("ts", 0)) < 60.0:
+                g_total = int(task.get("max_gen") or 0)
+                g_known = bool(g_total)
+        elif generating and gen is not None:
+            g_done = int(gen or 0)
+            g_rate = float(s.get("tok_s") or 0.0)
+            if not g_rate:
+                g_rate = float(s.get("tokens_per_s") or 0.0)
+            if not g_rate:
                 try:
-                    frac = max(0.0, min(1.0, float(pre.get("progress") or 0.0)))
-                except Exception:
-                    frac = 0.0
-                try:
-                    if getattr(self, "_prog_mode", None) != "determinate":
-                        self.prog_bar.stop()
-                        self.prog_bar.configure(mode="determinate")
-                        self._prog_mode = "determinate"
-                    self.prog_bar["value"] = round(frac * 100, 1)
-                    pt = f"{ptok:,}" if isinstance(ptok, int) else "?"
-                    self.prog_var.set(
-                        "进度: 读取 prompt %s tokens (%.0f%%), %.0fs%s"
-                        % (pt, frac * 100, el or 0.0,
-                           (", %.0f tok/s" % tok_s) if tok_s else ""))
-                    self.prog_lbl.configure(foreground="#cc6600")
-                except Exception:
-                    pass
-                return
-            if latest and (nowt - latest.get("ts", 0)) < 5.0:
-                generating = True
-                prefill = False
-                gen = latest.get("n_gen")
-                tok_s = latest.get("tg")
-                mx = None
-                try:
-                    if getattr(self, "_prog_mode", None) != "determinate":
-                        self.prog_bar.stop()
-                        self.prog_bar.configure(mode="determinate")
-                        self._prog_mode = "determinate"
-                    # 没有 max_tokens 就退化成滚动条 (不确定进度时不该假装知道)
-                    self.prog_bar.configure(mode="indeterminate")
-                    self.prog_bar.start()
-                    self._prog_mode = "indeterminate"
-                    rate = ("%.1f tok/s" % tok_s) if tok_s else "—"
-                    self.prog_var.set("进度: 生成中 %s tokens, %s" % (gen, rate))
-                    self.prog_lbl.configure(foreground="#0066cc")
-                except Exception:
-                    pass
-                return
+                    g_rate = float(self._strata_rate(g_done, now) or 0.0)
+                except Exception:                        # noqa: BLE001
+                    g_rate = 0.0
+            try:
+                cap = int(mx) if mx else 0
+            except Exception:                            # noqa: BLE001
+                cap = 0
+            # max_tokens 是**本轮请求的上限** (请求没写时引擎自己定, 一般
+            # 是上下文的八分之一或 4096)。离谱的大值说明它不是请求上限
+            # (是上下文余量), 拿它当 100% 只会让条子永远趴在 0% —— 那就
+            # 不给百分比, 走不定长。
+            if 0 < cap <= 32768:
+                g_total = cap
+                g_known = True
+
+        # ---- 画这一根条 ----
         try:
-            if generating and not prefill and gen is not None:
-                frac = 0.0
-                if mx:
-                    frac = max(0.0, min(1.0, float(gen) / float(mx)))
-                if getattr(self, "_prog_mode", None) != "determinate":
-                    try:
-                        self.prog_bar.stop()
-                    except Exception:
-                        pass
-                    self.prog_bar.configure(mode="determinate")
-                    self._prog_mode = "determinate"
-                self.prog_bar["value"] = round(frac * 100, 1)
-                rate = f"{tok_s:.1f} tok/s" if isinstance(tok_s, (int, float)) else "—"
-                eltxt = f", {el:.0f}s" if isinstance(el, (int, float)) else ""
-                self.prog_var.set(
-                    f"进度: {phase or '生成'} {gen}/{mx if mx else '?'} tokens, {rate}{eltxt}")
-                self.prog_lbl.configure(foreground="#0066cc")
-            elif prefill:
-                if getattr(self, "_prog_mode", None) != "indeterminate":
-                    self.prog_bar.configure(mode="indeterminate")
-                    self.prog_bar.start()
-                    self._prog_mode = "indeterminate"
-                pt = f"{ptok:,}" if isinstance(ptok, int) else "?"
-                eltxt = f", {el:.0f}s" if isinstance(el, (int, float)) else ""
-                self.prog_var.set(f"进度: 读取 prompt {pt} tokens{eltxt} (prefill)")
+            if reading and (p_total or ptok):
+                self._set_bar_mode("determinate")
+                if p_total:
+                    pct = max(0.0, min(1.0, p_done / float(p_total)))
+                    self.prog_bar["value"] = round(pct * 100, 1)
+                    eta = self._eta(p_total - p_done, p_rate)
+                    self.prog_var.set("预填充 %.1f%%  %s / %s tokens%s%s" % (
+                        pct * 100, format(p_done, ","), format(p_total, ","),
+                        ("  %.0f tok/s" % p_rate) if p_rate else "", eta))
+                else:
+                    # 有上下文长度但读不到进度 -> 不谎报百分比
+                    self.prog_bar["value"] = 0
+                    self.prog_var.set("预填充  上下文 %s tokens" %
+                                      format(int(ptok), ","))
                 self.prog_lbl.configure(foreground="#cc6600")
+            elif generating and (g_done or g_total):
+                if g_known and g_total:
+                    self._set_bar_mode("determinate")
+                    pct = max(0.0, min(1.0, g_done / float(g_total)))
+                    self.prog_bar["value"] = round(pct * 100, 1)
+                    eta = self._eta(g_total - g_done, g_rate)
+                    self.prog_var.set("生成 %.1f%%  %s / %s tokens%s%s" % (
+                        pct * 100, format(g_done, ","), format(g_total, ","),
+                        ("  %.1f tok/s" % g_rate) if g_rate else "", eta))
+                else:
+                    # 上限未知 (没抓到 n_predict / max_tokens) -> 不编百分比
+                    self._set_bar_mode("indeterminate")
+                    self.prog_var.set("生成 %s tokens%s" % (
+                        format(g_done, ","),
+                        ("  %.1f tok/s" % g_rate) if g_rate else ""))
+                self.prog_lbl.configure(foreground="#0066cc")
             else:
-                if getattr(self, "_prog_mode", None) != "determinate":
-                    try:
-                        self.prog_bar.stop()
-                    except Exception:
-                        pass
-                    self.prog_bar.configure(mode="determinate")
-                    self._prog_mode = "determinate"
+                self._set_bar_mode("determinate")
                 self.prog_bar["value"] = 0
-                txt = "空闲" if state in ("idle", "") else (state or "未加载")
-                self.prog_var.set(f"进度: {txt}")
+                self.prog_var.set("空闲")
                 self.prog_lbl.configure(foreground="#888888")
-        except Exception:
+        except Exception:                                # noqa: BLE001
             pass
+
+    def _set_bar_mode(self, mode: str) -> None:
+        """进度条在「确定/不定长」之间切换 (只做真正要改的那一步)。"""
+        cur = getattr(self, "_prog_mode", None)
+        if cur == mode:
+            return
+        try:
+            if cur == "indeterminate":
+                self.prog_bar.stop()
+        except Exception:                                # noqa: BLE001
+            pass
+        self.prog_bar.configure(mode=mode)
+        if mode == "indeterminate":
+            try:
+                self.prog_bar.start(12)
+            except Exception:                            # noqa: BLE001
+                pass
+        self._prog_mode = mode
+
+    def _strata_rate(self, gen, now: float):
+        """Strata 的 /status 不报 tok_s, 用相邻两次轮询的增量算。
+
+        轮询是后台线程 2 秒一轮 (状态没变化会退避), 所以只信「计数涨了、
+        时间也涨了」的样本。换了一次生成 (计数回退) 或断档超过 6 秒就重新
+        起算, 免得把上一次的速度当成这次的。
+        """
+        try:
+            g = int(gen or 0)
+        except Exception:
+            return None
+        prev = getattr(self, "_strata_gen", None)
+        rate = getattr(self, "_strata_rate_val", None)
+        if prev is None or g < prev[1] or (now - prev[0]) > 6.0:
+            self._strata_gen = (now, g)
+            return rate
+        if g > prev[1] and (now - prev[0]) >= 0.4:
+            rate = (g - prev[1]) / (now - prev[0])
+            self._strata_gen = (now, g)
+            self._strata_rate_val = rate
+        return rate
 
     def _render_status(self) -> None:
         """更新状态条 (模型标签原地更新, 避免 destroy/recreate 导致 tooltip 闪烁)。"""
@@ -2782,10 +2942,163 @@ class MonitorWindow(tk.Toplevel):
         # 完整 JSON
         text.insert("1.0", json.dumps(m, ensure_ascii=False, indent=2))
         text.configure(state=tk.DISABLED)
-        # 关闭按钮
+        # 切换 / 卸载 + 关闭
         btn_frame = ttk.Frame(win, padding=6)
         btn_frame.pack(fill=tk.X)
+        ttk.Button(btn_frame, text="⟳ 切换到此模型",
+                   command=lambda: (win.destroy(), self._switch_model_to(mid))
+                   ).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(btn_frame, text="⏏ 卸载",
+                   command=lambda: (win.destroy(), self._unload_model(mid))
+                   ).pack(side=tk.LEFT)
         ttk.Button(btn_frame, text="关闭", command=win.destroy).pack(side=tk.RIGHT)
+
+    # ---------------- 切换 / 卸载 (直连网关) ----------------
+    def _choose_and_switch(self) -> None:
+        """列出 /v1/models 里的模型, 选中后直接 POST /models/load。"""
+        models = [m for m in ((self._http_state or {}).get("models") or [])
+                  if m.get("id")]
+        if not models:
+            messagebox.showinfo("切换模型",
+                                "还没拿到模型列表。确认网关在运行, 或先点「刷新」。")
+            return
+        win = tk.Toplevel(self)
+        win.title("切换模型")
+        win.geometry("620x420")
+        win.transient(self)
+        ttk.Label(win, text="双击或选中后点「切换」；● 已加载　○ 未加载",
+                  foreground="#555").pack(anchor=tk.W, padx=8, pady=(8, 4))
+        box = ttk.Frame(win)
+        box.pack(fill=tk.BOTH, expand=True, padx=8)
+        lb = tk.Listbox(box, font=("Consolas", 10), activestyle="dotbox")
+        ysb = ttk.Scrollbar(box, orient=tk.VERTICAL, command=lb.yview)
+        lb.configure(yscrollcommand=ysb.set)
+        lb.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        ysb.pack(side=tk.RIGHT, fill=tk.Y)
+        ids: List[str] = []
+        sel = 0
+        for i, m in enumerate(models):
+            mid = str(m.get("id"))
+            ids.append(mid)
+            loaded = model_status_value(m) == "loaded"
+            lb.insert(tk.END, f"{'●' if loaded else '○'} {mid}")
+            if loaded:
+                sel = i
+        if ids:
+            lb.selection_set(sel)
+            lb.see(sel)
+
+        def _ok(_e=None) -> None:
+            cur = lb.curselection()
+            if not cur:
+                return
+            win.destroy()
+            self._switch_model_to(ids[cur[0]])
+
+        lb.bind("<Double-Button-1>", _ok)
+        row = ttk.Frame(win, padding=8)
+        row.pack(fill=tk.X)
+        ttk.Button(row, text="切换", command=_ok).pack(side=tk.RIGHT, padx=(6, 0))
+        ttk.Button(row, text="取消", command=win.destroy).pack(side=tk.RIGHT)
+
+    def _switch_model_to(self, mid: str, ask: bool = True) -> None:
+        if not mid:
+            return
+        if ask and not messagebox.askyesno(
+                "切换模型",
+                f"加载 {mid}？\n\n当前后端会先卸载，正在生成的回答会中断。\n"
+                "Strata 档位一般 10 秒到几分钟。"):
+            return
+        self._switch_var.set(f"切换中: {mid} …")
+        self._switch_btn.configure(state=tk.DISABLED)
+        threading.Thread(target=self._switch_worker, args=(mid,),
+                         daemon=True).start()
+
+    def _switch_worker(self, mid: str) -> None:
+        ok, msg = False, ""
+        try:
+            url = f"http://{self._host}:{self._port}/models/load"
+            with httpx.post_json(url, {"model": mid}, timeout=3600) as r:
+                msg = r.read().decode("utf-8", "replace")
+            ok = True
+        except Exception as e:
+            msg = f"{type(e).__name__}: {e}"
+        self.after(0, lambda: self._switch_done(mid, ok, msg))
+
+    def _switch_done(self, mid: str, ok: bool, msg: str) -> None:
+        self._switch_btn.configure(state=tk.NORMAL)
+        self._switch_var.set(("已切换: " if ok else "切换失败: ") + mid)
+        self._http_kick.set()            # 立刻重拉 /v1/models, 圆点状态马上更新
+        if not ok:
+            messagebox.showerror("切换模型", f"{mid}\n\n{msg}")
+
+    def _unload_model(self, mid: str) -> None:
+        if not messagebox.askyesno("卸载模型", f"卸载 {mid}？"):
+            return
+        self._switch_var.set(f"卸载中: {mid} …")
+
+        def work() -> None:
+            try:
+                url = f"http://{self._host}:{self._port}/models/unload"
+                with httpx.post_json(url, {"model": mid}, timeout=300) as r:
+                    r.read()
+                self.after(0, lambda: self._switch_var.set(f"已卸载: {mid}"))
+            except Exception as e:
+                err = f"{type(e).__name__}: {e}"
+                self.after(0, lambda: self._switch_var.set(f"卸载失败: {mid}"))
+                self.after(0, lambda: messagebox.showerror("卸载模型", err))
+            self._http_kick.set()
+        threading.Thread(target=work, daemon=True).start()
+
+    def _release_resources(self) -> None:
+        """强制释放显存/内存: 不管模型是谁加载的 (网关、桌面端、手动),
+        把引擎进程全部结束掉。"""
+        if not messagebox.askyesno(
+                "强制释放显存/内存",
+                "结束所有模型引擎进程？\n\n"
+                "会把正在跑的模型 (不管是谁加载的: 网关、桌面端、手动起的)\n"
+                "全部结束掉，显存和内存立刻还给系统。\n"
+                "正在生成的回答会中断，之后要重新加载模型才能继续用。"):
+            return
+        self._switch_var.set("释放中 …")
+        self._release_btn.configure(state=tk.DISABLED)
+
+        def work() -> None:
+            try:
+                url = f"http://{self._host}:{self._port}/admin/release"
+                with httpx.post_json(url, {}, timeout=180) as r:
+                    body = r.read().decode("utf-8", "replace")
+                ok = True
+            except Exception as e:
+                body = f"{type(e).__name__}: {e}"
+                ok = False
+            self.after(0, lambda: self._release_done(ok, body))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _release_done(self, ok: bool, body: str) -> None:
+        self._release_btn.configure(state=tk.NORMAL)
+        if not ok:
+            self._switch_var.set("释放失败")
+            messagebox.showerror("强制释放", body)
+            return
+        try:
+            data = json.loads(body)
+        except Exception:                                # noqa: BLE001
+            data = {}
+        stopped = data.get("stopped") or []
+        killed = data.get("killed") or []
+        lines = []
+        lines.append("已停止的后端: " + (", ".join(str(x) for x in stopped)
+                                         if stopped else "无"))
+        if killed:
+            lines.append("已结束的引擎进程:")
+            for k in killed:
+                lines.append(f"  pid {k.get('pid')}: {str(k.get('cmd') or '')[:110]}")
+        else:
+            lines.append("没有残留的引擎进程")
+        self._switch_var.set("已释放显存/内存")
+        messagebox.showinfo("强制释放", "\n".join(lines))
+        self._http_kick.set()
 
 
 # =========================================================================
@@ -3265,6 +3578,54 @@ class App(tk.Tk):
             messagebox.showerror("失败", msg)
         self._log(f"[环境修复 {it.name}] {msg}")
 
+    def _on_release_all(self) -> None:
+        """强制释放显存/内存: 让网关停掉所有后端, 并结束任何还在跑的引擎进程
+        (桌面端起的、手动起的都算) —— 显存和内存立刻还给系统。"""
+        if not messagebox.askyesno(
+                "强制释放显存/内存",
+                "结束所有模型引擎进程？\n\n"
+                "会把正在跑的模型 (不管是谁加载的: 网关、桌面端、手动起的)\n"
+                "全部结束掉，显存和内存立刻还给系统。\n"
+                "正在生成的回答会中断，之后要重新加载模型才能继续用。"):
+            return
+        port = int(self.cfg.get("port", 8080))
+        self.status_var.set("正在释放显存/内存 …")
+
+        def work() -> None:
+            try:
+                with httpx.post_json(f"http://127.0.0.1:{port}/admin/release",
+                                     {}, timeout=180) as r:
+                    body = r.read().decode("utf-8", "replace")
+                ok = True
+            except Exception as e:                        # noqa: BLE001
+                body = f"{type(e).__name__}: {e}"
+                ok = False
+            self.after(0, lambda: self._release_all_done(ok, body))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _release_all_done(self, ok: bool, body: str) -> None:
+        if not ok:
+            self.status_var.set("释放失败")
+            messagebox.showerror("强制释放", body)
+            return
+        try:
+            data = json.loads(body)
+        except Exception:                                # noqa: BLE001
+            data = {}
+        stopped = data.get("stopped") or []
+        killed = data.get("killed") or []
+        lines = ["已停止的后端: " + (", ".join(str(x) for x in stopped)
+                                     if stopped else "无")]
+        if killed:
+            lines.append("已结束的引擎进程:")
+            for k in killed:
+                lines.append(f"  pid {k.get('pid')}: {str(k.get('cmd') or '')[:110]}")
+        else:
+            lines.append("没有残留的引擎进程")
+        self.status_var.set("已释放显存/内存")
+        self._log("强制释放: " + " | ".join(lines))
+        messagebox.showinfo("强制释放", "\n".join(lines))
+
     def _build_service_tab(self) -> None:
         f = ttk.Frame(self.nb, padding=10)
         self.nb.add(f, text="服务")
@@ -3294,6 +3655,10 @@ class App(tk.Tk):
                 ("启动", self._on_start), ("停止", self._on_stop), ("重启", self._on_restart),
                 ("前台运行", self._on_run_fg), ("刷新状态", self._on_refresh_status),
             ]), padx=2, pady=2)
+        # 强制释放显存/内存: 不管模型是谁加载的 (网关/桌面端/手动), 全停。
+        ttk.Button(box1, text="🔓 释放显存/内存", width=16,
+                   command=self._on_release_all).grid(
+            row=1, column=0, columnspan=2, padx=2, pady=(6, 2), sticky=tk.W)
 
         box2 = ttk.LabelFrame(f, text="llama-router-watchdog  显存守护", padding=6)
         box2.grid(row=2, column=0, columnspan=4, sticky=tk.EW, pady=4)
@@ -3525,9 +3890,15 @@ class App(tk.Tk):
         box1.columnconfigure(3, weight=0)
 
         # ===== 推测解码 (独立启用开关, 默认折叠, 用按钮展开) =====
-        # 占 0 空间, 给参数面板更多位置
+        # 占 0 空间, 给参数面板更多位置。
+        # 仅主池 llama-server 有独立草稿模型; 「⚡KVMem」页 (ninfer) 的推测解码
+        # 是另一套方言 (--spec / --draft-tokens / --adaptive-mtp / --ngram-*), 已
+        # 作为普通参数列进 kvmem 参数表, 这里整块不显示。控件仍照常创建 (只是不
+        # pack), 免得下游 _sync_draft_box / _on_select_model 等引用报 AttributeError。
         draft_toggle_bar = ttk.Frame(master)
-        draft_toggle_bar.pack(fill=tk.X, padx=4, pady=(0, 2))
+        W._draft_bar = draft_toggle_bar
+        if W.ws_kind != "kvmem":
+            draft_toggle_bar.pack(fill=tk.X, padx=4, pady=(0, 2))
         W.var_draft_enabled = tk.BooleanVar(value=False)
         ttk.Checkbutton(draft_toggle_bar,
                         text="启用推测解码 (MTP / DFlash / ngram)",
@@ -3551,14 +3922,10 @@ class App(tk.Tk):
         W.var_draft_p_split = tk.StringVar(value="0.1")
         W.var_draft_p_min = tk.StringVar(value="0.0")
         W.var_draft_ngl = tk.StringVar(value="auto")
-        # 草稿面板按工作区裁剪: 面板上每个控件背后都是一条 CLI flag, 所以只能
-        # 显示这个工作区**真正指向的那个程序**认识的那几条。
-        #   pool  -> 主池 llama-server, 支持独立草稿模型 (上游 spec-draft-* 齐全)
-        #   kvmem -> llama-kvmem-server, --help 里 spec/MTP flag 只有 4 个:
-        #             --spec-type / --spec-draft-n-max / --spec-draft-p-min /
-        #             --spec-kv-dtype (官方 README 明确不支持独立草稿模型)
-        # 见 config.KVMEM_SPEC_KEYS。裁掉的那几条对 kvmem 是静默失效, 显示出来
-        # 只会让人以为改了有用。
+        # 草稿面板只服务主池 llama-server (独立草稿模型); 「⚡KVMem」页 (ninfer)
+        # 整块不显示 (见上方 draft_toggle_bar 的说明与 _sync_draft_box)。
+        # W._draft_kv 仍保留: 对 kvmem 这里渲染出来的控件不会被 pack, 只是占位,
+        # 避免下游 (_sync_draft_box / _on_select_model) 引用时报错。
         W._draft_kv = getattr(W, "ws_kind", "pool") == "kvmem"
         spec_keys = config.KVMEM_SPEC_KEYS if W._draft_kv else config.DRAFT_BOX_KEYS
         opt_keys = tuple(k for k in config.DRAFT_OPT_KEYS if k in spec_keys)
@@ -3717,10 +4084,13 @@ class App(tk.Tk):
         llama.cpp 默认值。这些 key 已从模型参数子表排除, 避免渲染两遍。
         """
         wrap = ttk.Frame(master)
-        # expand=True: 窗口够高时, 剩余空间全给这个面板 (看得更多);
-        # 窗口不够高时 pack 会压缩到可用高度, 靠滚动条/滚轮看剩下的
-        wrap.pack(fill=tk.X, expand=True, padx=4, pady=(6, 0))
         W._mmkv_wrap = wrap
+        # 「⚡KVMem」页 (ninfer) 的视觉 / KV 参数已作为普通参数列进 kvmem 参数表,
+        # 这里的 llama.cpp 专用区块 (mmproj / cache-type-k-v) 整块不显示。
+        if getattr(W, "ws_kind", "pool") != "kvmem":
+            # expand=True: 窗口够高时, 剩余空间全给这个面板 (看得更多);
+            # 窗口不够高时 pack 会压缩到可用高度, 靠滚动条/滚轮看剩下的
+            wrap.pack(fill=tk.X, expand=True, padx=4, pady=(6, 0))
 
         W._mmkv_expanded = tk.BooleanVar(value=False)
         W._mmkv_collapse_cb = ttk.Checkbutton(
@@ -3817,11 +4187,16 @@ class App(tk.Tk):
         W = W if W is not None else self
         box3 = ttk.LabelFrame(master, text=title, padding=6)
         box3.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+        # 「⚡KVMem」页的参数面板按当前档位的引擎过滤 (两个引擎并存)。
+        engine_getter = None
+        if scope in ("kvmem", "kvmem_full"):
+            engine_getter = lambda: config.model_engine(self._ws_model(W) or {})
         panel = ParamPanel(
             box3, scope=scope,
             get=lambda k: self._get_model_param(k, W),
             set_=lambda k, v: self._set_model_param(k, v, W),
             refresh_outer=lambda: None,
+            engine_getter=engine_getter,
         )
         W.model_param_panel = panel
         self._param_panels.append(panel)
@@ -3837,13 +4212,14 @@ class App(tk.Tk):
         self.kv = ModelWorkspace("kvmem")
         W = self.kv
 
-        # 顶部提示条 (与「模型」页同款)
+        # 顶部提示条
         top_bar = ttk.Frame(f)
         top_bar.pack(fill=tk.X, side=tk.TOP, pady=(0, 8))
         ttk.Label(
             top_bar,
-            text="  👉 界面与「模型」页完全一致，只是由 llama-kvmem-server 运行；"
-                 "程序路径在「全局」页的「KVMem-llama.cpp 程序」里改",
+            text="  👉 两套引擎并存: ninfer (KVMem v0.18.0, .ninfer) 与老 "
+                 "llama-kvmem-server (v0.16, .gguf); 档位按模型后缀自动选引擎，"
+                 "参数面板只显示当前引擎的方言。程序路径在「全局」页改",
             foreground="#555").pack(side=tk.LEFT, fill=tk.Y, padx=4, pady=4)
 
         # ---- 运行服务 (钉在底部, 把中间整块让给 列表 + 编辑器 + 参数) ----
@@ -3966,10 +4342,10 @@ class App(tk.Tk):
                 f"(model = {active.get('alias') or active.get('id')})")
         else:
             self.kvmem_url_var.set("调用地址: -")
-        exe = kvmem.find_exe(self.cfg)
+        exe = kvmem.find_exe(self.cfg, active)
         self.kvmem_exe_var.set(
             f"分支程序: {exe}" if exe else
-            "分支程序: 未找到 (「全局」页的「KVMem-llama.cpp 程序」留空则自动探测)")
+            "分支程序: 未找到 (「全局」页的「KVMem 程序」留空则自动探测)")
         self.kvmem_cuda_var.set(
             str((self.cfg.get("kvmem") or {}).get("cuda_device") or "0"))
         self._on_kvmem_refresh_status()
@@ -4821,10 +5197,33 @@ class App(tk.Tk):
         st["active_id"] = pid
         config.save(self.cfg)
         self._log(f"Strata 当前档位 -> {pid}")
+        if self.cfg.get("serve_mode") == config.STRATA_RUNTIME:
+            # 只写 active_id 不会换掉正在跑的后端, 这里直接让网关加载它
+            self._gateway_load_async(pid)
         if strata.is_installed():
             self.strata_hint_var.set(
                 "切换档位后请点「应用并重装」重新写入参数（Strata 加载要 1-3 分钟）。")
         self._refresh_strata_tab()
+
+    def _gateway_load_async(self, mid: str) -> None:
+        """让网关真正加载这个档位 (POST /models/load, 后台线程)。"""
+        port = int(self.cfg.get("port", 8080))
+        self._log(f"请求加载模型 -> {mid} …")
+        self.strata_par_msg.set(f"加载中: {mid} …")
+
+        def work() -> None:
+            try:
+                with httpx.post_json(f"http://127.0.0.1:{port}/models/load",
+                                     {"model": mid}, timeout=3600) as r:
+                    body = r.read().decode("utf-8", "replace")
+                self.after(0, lambda: self._log(f"✔ 已切换模型 -> {mid}: {body}"))
+                self.after(0, lambda: self.strata_par_msg.set(f"已切换: {mid}"))
+            except Exception as e:
+                err = f"{type(e).__name__}: {e}"
+                self.after(0, lambda: self._log(f"✘ 切换模型失败 -> {mid}: {err}"))
+                self.after(0, lambda: self.strata_par_msg.set(f"切换失败: {mid}"))
+                self.after(0, lambda: messagebox.showerror("切换模型", err))
+        threading.Thread(target=work, daemon=True).start()
 
     def _on_strata_remove(self) -> None:
         m = self._strata_sel_model()
@@ -4924,6 +5323,10 @@ class App(tk.Tk):
     def _sync_draft_box(self, W=None) -> None:
         W = W if W is not None else self
         """按启用开关 + 折叠状态显示/隐藏推测解码面板。"""
+        # ninfer 的 KVMem 页没有草稿面板 (推测解码是普通参数), 永不显示
+        if getattr(W, "ws_kind", "pool") == "kvmem":
+            W.draft_box.pack_forget()
+            return
         if not W.var_draft_enabled.get() or W._draft_collapsed.get():
             W.draft_box.pack_forget()
             return
@@ -5217,24 +5620,24 @@ class App(tk.Tk):
         m["base_url"] = W.var_base_url.get().strip()   # 留空表示用本机
         m["api_key"] = W.var_api_key.get().strip()     # 留空表示无
         m["enabled"] = bool(W.var_enabled.get())
-        m["draft_enabled"] = bool(W.var_draft_enabled.get())
-        m["draft_model"] = W.var_draft_model.get().strip()
-        m["draft_type"] = W.var_draft_type.get().strip()
-        m["draft_n_max"] = W.var_draft_n_max.get().strip() or "3"
-        m["draft_p_min"] = W.var_draft_p_min.get().strip() or "0.0"
-        # n-min / p-split / ngl 是**主池专属**的三个快捷字段 (scope="pool"):
-        # llama-kvmem-server 的 --help 里没有它们, 该工作区里也没有对应控件
-        # (见 _build_model_editor 的 spec_keys 裁剪), 所以不落盘。
+        # 草稿字段: 「⚡KVMem」页 (ninfer) 没有草稿面板 (推测解码就是参数表里的
+        # spec / draft-tokens / adaptive-mtp / ngram-*), 草稿相关顶层字段一律不落盘。
         if getattr(W, "_draft_kv", False):
-            m.pop("draft_n_min", None)
-            m.pop("draft_p_split", None)
-            m.pop("draft_ngl", None)
+            m["draft_enabled"] = False
+            for _k in ("draft_model", "draft_type", "draft_n_max", "draft_p_min",
+                       "draft_n_min", "draft_p_split", "draft_ngl", "draft_en"):
+                m.pop(_k, None)
         else:
+            m["draft_enabled"] = bool(W.var_draft_enabled.get())
+            m["draft_model"] = W.var_draft_model.get().strip()
+            m["draft_type"] = W.var_draft_type.get().strip()
+            m["draft_n_max"] = W.var_draft_n_max.get().strip() or "3"
+            m["draft_p_min"] = W.var_draft_p_min.get().strip() or "0.0"
             m["draft_n_min"] = W.var_draft_n_min.get().strip() or "0"
             m["draft_p_split"] = W.var_draft_p_split.get().strip() or "0.1"
             m["draft_ngl"] = W.var_draft_ngl.get().strip() or "auto"
-        # 快捷字段勾选状态 (每个字段独立决定写不写 ini)
-        m["draft_en"] = {k: bool(v.get()) for k, v in W.var_draft_en.items()}
+            # 快捷字段勾选状态 (每个字段独立决定写不写 ini)
+            m["draft_en"] = {k: bool(v.get()) for k, v in W.var_draft_en.items()}
         # 同步到 params 字典 (给 generate_preset 写 ini 使用)
         # 启用后草稿文件可选: 无路径时只写 spec-type 等其余草稿参数
         params = m.setdefault("params", {})
@@ -5556,29 +5959,39 @@ class App(tk.Tk):
         ttk.Label(box1, text="", foreground="#555").grid(
             row=len(rows), column=3)
 
-        # KVMem 分支程序 (「⚡ KVMem」页跑的就是它; 留空则按目录自动探测)
+        # KVMem 分支程序 (「⚡ KVMem」页跑的就是它; 留空则按目录自动探测)。
+        # 两套引擎并存: 老 llama-kvmem-server (吃 .gguf) 与 ninfer (吃 .ninfer),
+        # 各留一个可选的固定路径; 档位按模型后缀自动选引擎, 都留空 = 自动探测。
         box_kvmem = ttk.LabelFrame(
-            f_content, text="KVMem-llama.cpp 程序 (「⚡ KVMem」页运行的分支程序)",
+            f_content, text="KVMem 后端程序 (「⚡ KVMem」页运行的分支程序)",
             padding=10)
         box_kvmem.pack(fill=tk.X, pady=(0, 8))
         self.var_kvmem_exe = tk.StringVar()
-        ttk.Label(box_kvmem, text="程序路径 (llama-kvmem-server.exe):").grid(
-            row=0, column=0, sticky=tk.W, pady=3, padx=(0, 6))
-        ttk.Entry(box_kvmem, textvariable=self.var_kvmem_exe, width=50).grid(
-            row=0, column=1, sticky=tk.EW, pady=3)
-        ttk.Button(box_kvmem, text="浏览...",
-                   command=lambda: self._browse(self.var_kvmem_exe, "exe")).grid(
-            row=0, column=2, padx=4)
-        ttk.Button(box_kvmem, text="自动查找",
-                   command=self._on_kvmem_autofind_exe).grid(
-            row=0, column=3, padx=4)
+        self.var_kvmem_ninfer_exe = tk.StringVar()
+        kvmem_prog_rows = [
+            ("老引擎程序 (llama-kvmem-server.exe, 吃 .gguf):",
+             self.var_kvmem_exe, kvmem.ENGINE_LLAMA),
+            ("ninfer 程序 (ninfer-kvmem-server.exe, 吃 .ninfer):",
+             self.var_kvmem_ninfer_exe, kvmem.ENGINE_NINFER),
+        ]
+        for i, (label, var, eng) in enumerate(kvmem_prog_rows):
+            ttk.Label(box_kvmem, text=label).grid(
+                row=i, column=0, sticky=tk.W, pady=3, padx=(0, 6))
+            ttk.Entry(box_kvmem, textvariable=var, width=50).grid(
+                row=i, column=1, sticky=tk.EW, pady=3)
+            ttk.Button(box_kvmem, text="浏览...",
+                       command=lambda v=var: self._browse(v, "exe")).grid(
+                row=i, column=2, padx=4)
+            ttk.Button(box_kvmem, text="自动查找",
+                       command=lambda v=var, e=eng: self._on_kvmem_autofind_exe(v, e)).grid(
+                row=i, column=3, padx=4)
         self.var_kvmem_exe_used = tk.StringVar(value="当前实际使用: -")
         ttk.Label(box_kvmem, textvariable=self.var_kvmem_exe_used,
-                  foreground="#888").grid(row=1, column=0, columnspan=4,
+                  foreground="#888").grid(row=2, column=0, columnspan=4,
                                           sticky=tk.W, pady=(4, 0))
         ttk.Label(box_kvmem,
-                  text="留空 = 按 KVMem 安装目录递归探测最新的 llama-kvmem-server.exe",
-                  foreground="#888").grid(row=2, column=0, columnspan=4,
+                  text="留空 = 按安装目录递归探测 (config.json 的 kvmem.install_dir / kvmem.ninfer_install_dir)",
+                  foreground="#888").grid(row=3, column=0, columnspan=4,
                                           sticky=tk.W)
         box_kvmem.columnconfigure(1, weight=1)
         self._sync_kvmem_exe_label()
@@ -5670,36 +6083,45 @@ class App(tk.Tk):
         """按输入框当前(可能未保存)的值拼一份 cfg, 供 find_exe 探测。"""
         probe = dict(self.cfg)
         kv = dict(self.cfg.get("kvmem") or {})
-        kv["exe"] = self.var_kvmem_exe.get().strip() if hasattr(self, "var_kvmem_exe") else ""
+        kv["exe"] = (self.var_kvmem_exe.get().strip()
+                     if hasattr(self, "var_kvmem_exe") else "")
+        kv["ninfer_exe"] = (self.var_kvmem_ninfer_exe.get().strip()
+                            if hasattr(self, "var_kvmem_ninfer_exe") else "")
         probe["kvmem"] = kv
         return probe
 
     def _sync_kvmem_exe_label(self) -> None:
-        """刷新「当前实际使用: …」—— 手填且存在就用手填的, 否则用自动探测结果。"""
+        """刷新「当前实际使用」—— 按当前活跃档位的引擎显示对应的后端程序。"""
         if not hasattr(self, "var_kvmem_exe_used"):
             return
-        exe = kvmem.find_exe(self._kvmem_probe_cfg())
+        cfg = self._kvmem_probe_cfg()
+        active = kvmem.active_model(cfg)
+        exe = kvmem.find_exe(cfg, active)
+        engine = kvmem.engine_of(active) if active else ""
         if exe:
-            self.var_kvmem_exe_used.set(f"当前实际使用: {exe}")
+            self.var_kvmem_exe_used.set(
+                f"当前实际使用 ({engine or '?'} 引擎): {exe}")
         else:
             self.var_kvmem_exe_used.set(
-                "当前实际使用: 未找到 (请手动「浏览…」选择 llama-kvmem-server.exe)")
+                "当前实际使用: 未找到 (请手动「浏览…」选择 KVMem 后端: "
+                "ninfer-kvmem-server.exe / llama-kvmem-server.exe)")
 
-    def _on_kvmem_autofind_exe(self) -> None:
-        """「自动查找」: 清掉手填路径, 按安装目录探测并把结果填进输入框。"""
-        saved = self.var_kvmem_exe.get().strip()
-        self.var_kvmem_exe.set("")
-        exe = kvmem.find_exe(self._kvmem_probe_cfg())
-        self.var_kvmem_exe.set(exe)
+    def _on_kvmem_autofind_exe(self, var, engine) -> None:
+        """「自动查找」: 清掉手填路径, 按该引擎的安装目录探测并填进输入框。"""
+        saved = var.get().strip()
+        var.set("")
+        exe = kvmem.find_exe(self._kvmem_probe_cfg(), None, engine)
+        var.set(exe)
         self._sync_kvmem_exe_label()
         if exe:
-            self._log(f"KVMem 程序已自动查找: {exe}")
+            self._log(f"KVMem 程序已自动查找 ({engine}): {exe}")
         else:
-            self.var_kvmem_exe.set(saved)
+            var.set(saved)
             self._sync_kvmem_exe_label()
             messagebox.showwarning(
                 "未找到",
-                "在 KVMem 安装目录下没找到 llama-kvmem-server.exe，\n"
+                f"在 {engine} 引擎的安装目录下没找到后端 "
+                "(ninfer-kvmem-server.exe / llama-kvmem-server.exe)，\n"
                 "请点「浏览…」手动选择。")
 
     def _open_file(self, path: str) -> None:
@@ -5728,6 +6150,7 @@ class App(tk.Tk):
             gw["preload"] = bool(self.var_preload.get())
             kv = self.cfg.setdefault("kvmem", {})
             kv["exe"] = self.var_kvmem_exe.get().strip()
+            kv["ninfer_exe"] = self.var_kvmem_ninfer_exe.get().strip()
         except ValueError as e:
             messagebox.showerror("错误", f"数值字段不合法: {e}")
             return
@@ -5784,8 +6207,10 @@ class App(tk.Tk):
             self.var_preload.set(bool((self.cfg.get("gateway") or {}).get(
                 "preload", False)))
         if hasattr(self, "var_kvmem_exe"):
-            self.var_kvmem_exe.set(
-                str((self.cfg.get("kvmem") or {}).get("exe") or ""))
+            kv = self.cfg.get("kvmem") or {}
+            self.var_kvmem_exe.set(str(kv.get("exe") or ""))
+            if hasattr(self, "var_kvmem_ninfer_exe"):
+                self.var_kvmem_ninfer_exe.set(str(kv.get("ninfer_exe") or ""))
             self._sync_kvmem_exe_label()
         wd = self.cfg.get("watchdog", {}) or {}
         self.var_wd_enabled.set(bool(wd.get("enabled", False)))
